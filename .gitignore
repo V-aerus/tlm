@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
+# Ignore the large project-specific dataset
+tlm_dataset/
 __pycache__/
 *.py[cod]
 *$py.class

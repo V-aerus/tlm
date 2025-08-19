@@ -7,7 +7,7 @@ import tqdm
 import tvm
 from common import register_data_path
 import os
-
+from utils import get_measure_records
 
 @dataclass
 class ScriptArguments:
@@ -24,14 +24,28 @@ def main():
     from common import MEASURE_RECORD_FOLDER, clean_name
     os.makedirs(MEASURE_RECORD_FOLDER, exist_ok=True)
     assert(MEASURE_RECORD_FOLDER is not None)
+    
 
-    files = glob.glob(f'{MEASURE_RECORD_FOLDER}/*.json')
-    for file in files:
-        os.remove(file)
+    #files = glob.glob(f'{MEASURE_RECORD_FOLDER}/*.json')
     files = []
+    measure_records = get_measure_records()
+    print(f"Measure records: {measure_records}")
+    if measure_records:
+        files.extend(measure_records)
+    else:
+        files = glob.glob(f'{MEASURE_RECORD_FOLDER}/*.json')  # 回退到原有逻辑
+    print(f"Files after measure_records: {files}")  # 添加调试输出
+    #for file in files:
+        #os.remove(file)
+    #files = []
     from utils import get_finetuning_files, get_testtuning_files
+    finetuning_files = get_finetuning_files()
+    testtuning_files = get_testtuning_files()
+    print(f"Finetuning files: {finetuning_files}")  # 添加调试输出
+    print(f"Testtuning files: {testtuning_files}")  # 添加调试输出
     files.extend(get_finetuning_files())
     files.extend(get_testtuning_files())
+    print(f"Found files: {files}")
 
     record_dic = {}
     measured_record_set = set()
@@ -61,6 +75,7 @@ def main():
                 f.write('\n')
 
     from common import HARDWARE_PLATFORM
+    print(f"HARDWARE_PLATFORM: {HARDWARE_PLATFORM}")
     assert HARDWARE_PLATFORM is not None
     measured_pkl_path = f'measured_{HARDWARE_PLATFORM}.pkl'
     with open(measured_pkl_path, 'wb') as f:
@@ -84,3 +99,4 @@ def check_measured(i_str):
     # if measured:
     #     print('measured', end=' ')
     return measured
+

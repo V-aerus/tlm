@@ -2,13 +2,12 @@ import pickle
 from tvm import auto_scheduler
 import re
 import glob
-
+import os
 
 NETWORK_INFO_FOLDER = None
 TO_MEASURE_PROGRAM_FOLDER = None
 MEASURE_RECORD_FOLDER = None
 HARDWARE_PLATFORM = None
-
 
 def clean_name(x):
     x = str(x)
@@ -17,20 +16,19 @@ def clean_name(x):
     x = x.replace("'", "")
     return x
 
-
 def register_data_path(target_str):
     assert(isinstance(target_str, str))
-    model_list = ['i7', 'v100', 'a100', '2080', 'None']
+    model_list = ['i7', 'v100', 'a100', '2080', '4090', 'Xavier', 'None']
     for model in model_list:
-        if model in target_str:
+        if model in target_str.lower():  # 忽略大小写，提高兼容性
             break
     assert(model != 'None')
 
     print(f'register data path: {model}')
     global NETWORK_INFO_FOLDER, TO_MEASURE_PROGRAM_FOLDER, MEASURE_RECORD_FOLDER, HARDWARE_PLATFORM
-    NETWORK_INFO_FOLDER = f"dataset/network_info/{model}"
-    TO_MEASURE_PROGRAM_FOLDER = f"dataset/to_measure_programs/{model}"
-    MEASURE_RECORD_FOLDER = f"dataset/measure_records/{model}"
+    NETWORK_INFO_FOLDER = f"/home/hangshuaihe/tlm/tlm_dataset/gen/dataset/network_info/{model}"
+    TO_MEASURE_PROGRAM_FOLDER = f"/home/hangshuaihe/tlm/tlm_dataset/gen/dataset/to_measure_programs/{model}"
+    MEASURE_RECORD_FOLDER = f"/home/hangshuaihe/tlm/tlm_dataset/gen/dataset/measure_records/{model}"
     HARDWARE_PLATFORM = model
 
 

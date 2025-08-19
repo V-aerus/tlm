@@ -11,6 +11,7 @@ if os.path.exists(log_file):
         # 删除文件
         os.remove(log_file)
 
+#--resume_from_checkpoint=/home/hangshuaihe/tlm/tlm_dataset/gen/gen_data/clm_gen_base_xavier_continued/checkpoint-108000 \
 # 构建完整的 screen 命令
 cmd = """tmux new -s %s -d '{ 
 { 
@@ -19,35 +20,23 @@ echo "#################################################################"
 date
 
 export PYTHONUNBUFFERED=1
-CUDA_VISIBLE_DEVICES=0,1,2,3 python train_clm.py \
+time CUDA_VISIBLE_DEVICES=0 python train_clm.py \
                                     --do_train \
                                     --model_type=gpt2 \
-                                    --tokenizer_name=gen_data/gen_tokenizer_v100 \
-                                    --output_dir=gen_data/clm_gen_v100 \
-                                    --dataset_name=gen_data/v100_gen_2154 \
+                                    --tokenizer_name=/home/hangshuaihe/tlm/tlm_dataset/gen/gen_data/gen_tokenizer_v100 \
+                                    --output_dir=/home/hangshuaihe/tlm/tlm_dataset/gen/gen_data/clm_gen_bast_v100_test_v1 \
+                                    --dataset_name=/home/hangshuaihe/tlm/tlm_dataset/gen/gen_data/sft_dataset_v100_v1 \
+                                    --model_name_or_path=/home/hangshuaihe/tlm/tlm_dataset/gen/gen_data/clm_gen_v100 \
                                     --per_device_train_batch_size=5 \
-                                    \
-                                    --overwrite_output_dir=True \
+                                    --overwrite_output_dir=False \
                                     --logging_steps=100 \
-                                    --num_train_epochs=3 \
-                                    --remove_unused_columns=False \
-                                    --learning_rate=5e-5 \
-                                    --save_steps=4000 \
-                                    # --model_name_or_path=clm_gen_v100/checkpoint-56000
-                                    # --resume_from_checkpoint=clm_gen/checkpoint-52000
-
-
-                                    
-                                    # --do_eval \
-                                    # --per_device_eval_batch_size=128 \
-                                    # --evaluation_strategy=steps \
-                                    # --eval_steps=80000000000000 \
+                                    --num_train_epochs=1 \
+                                    --save_steps=8000
 
 
 date
 } |& tee -a %s 
 }' 
 """ % (session_name, log_file)
-
 # 使用 subprocess 运行命令
 subprocess.Popen(cmd, shell=True)

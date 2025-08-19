@@ -7,6 +7,7 @@ from itertools import chain
 from typing import Optional
 
 import datasets
+from datasets import load_dataset
 import evaluate
 import torch
 from datasets import load_from_disk
@@ -22,6 +23,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
     default_data_collator,
+    DataCollatorForLanguageModeling,
     is_torch_tpu_available,
     set_seed,
     EarlyStoppingCallback
@@ -32,6 +34,21 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 import numpy as np
 os.environ["WANDB_DISABLED"] = "true"
+
+"""
+MoSLoRA integration: ensure the local customized PEFT is importable.
+We prefer a local path to `MosLora/peft/src` over any installed PEFT.
+"""
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_PEFT_PATH = os.path.join(_BASE_DIR, "MosLora", "peft", "src")
+if os.path.isdir(_LOCAL_PEFT_PATH) and _LOCAL_PEFT_PATH not in sys.path:
+    sys.path.append(_LOCAL_PEFT_PATH)
+
+try:
+    from peft import LoraConfig, get_peft_model
+except Exception:
+    LoraConfig = None
+    get_peft_model = None
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -120,6 +137,21 @@ class ModelArguments:
         },
     )
     early_stopping_patience: Optional[int] = field(default=None, metadata={"help": ""})
+
+    # --- MoSLoRA/PEFT arguments ---
+    use_moslora: bool = field(default=False, metadata={"help": "Enable MoSLoRA via customized PEFT"})
+    lora_r: Optional[int] = field(default=16, metadata={"help": "LoRA rank r"})
+    lora_alpha: Optional[int] = field(default=32, metadata={"help": "LoRA alpha"})
+    lora_dropout: Optional[float] = field(default=0.05, metadata={"help": "LoRA dropout"})
+    target_modules: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated list of module suffixes to adapt (e.g. 'q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj,c_attn,c_fc,c_proj'). "
+                "If not provided, a broad default covering common architectures will be used."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
@@ -264,11 +296,12 @@ def main():
             )
 
     # Set seed before initializing model.
+    # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    if data_args.dataset_name is not None:
-        tokenized_datasets = load_from_disk(data_args.dataset_name, keep_in_memory=True)
+    # --- START OF REPLACEMENT BLOCK ---
 
+    # Load pretrained model and tokenizer
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
@@ -277,12 +310,11 @@ def main():
     }
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
-    # elif model_args.model_name_or_path:
-    #     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+    elif model_args.model_name_or_path:
+        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
     config_kwargs = {
@@ -293,36 +325,12 @@ def main():
     if model_args.config_name:
         config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
     elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs,
-                                            # attn_pdrop=0.1,
-                                            # embd_pdrop=0.1,
-                                            # resid_pdrop=0.1,
-                                            # summary_first_dropout=0.1
-                                            )
+        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
     else:
-        config = CONFIG_MAPPING[model_args.model_type](
-            vocab_size=tokenizer.vocab_size, 
-            max_position_embeddings=tokenizer.model_max_length, 
-            bos_token_id=tokenizer.bos_token_id,
-            cls_token_id=tokenizer.cls_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            mask_token_id=tokenizer.mask_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            sep_token_id=tokenizer.sep_token_id,
-            unk_token_id=tokenizer.unk_token_id,
-            # n_embd=256,
-            # n_head=4,
-            # n_layer=4,
-            # attn_pdrop=0.1,
-            # embd_pdrop=0.1,
-            # resid_pdrop=0.1,
-            # summary_first_dropout=0.1
-        )
+        config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
         if model_args.config_overrides is not None:
-            logger.info(f"Overriding config: {model_args.config_overrides}")
             config.update_from_string(model_args.config_overrides)
-            logger.info(f"New config: {config}")
 
     if model_args.model_name_or_path:
         torch_dtype = (
@@ -342,101 +350,126 @@ def main():
         )
     else:
         model = AutoModelForCausalLM.from_config(config)
-        n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
+        n_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
 
-    # state_dict = torch.load('clm_gen_v100_ori/pytorch_model.bin', map_location='cpu')
-    # del state_dict['transformer.wte.weight']
-    # del state_dict['lm_head.weight']
-    # model.load_state_dict(state_dict, strict=False)
-
-    print("Config:", config)
-    print("Model:", model)
-
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
-    if data_args.block_size is None:
-        block_size = tokenizer.model_max_length
-        if block_size > 1024:
-            logger.warning(
-                "The chosen tokenizer supports a `model_max_length` that is longer than the default `block_size` value"
-                " of 1024. If you would like to use a longer `block_size` up to `tokenizer.model_max_length` you can"
-                " override this default with `--block_size xxx`."
+    print("Config:", config)
+    print("Model:", model)
+
+    # --- Optionally wrap with MoSLoRA (custom PEFT) ---
+    if model_args.use_moslora:
+        if LoraConfig is None or get_peft_model is None:
+            raise ImportError(
+                "MoSLoRA requested but custom PEFT could not be imported. Ensure 'MosLora/peft/src' exists."
             )
-            block_size = 1024
-    else:
-        if data_args.block_size > tokenizer.model_max_length:
-            logger.warning(
-                f"The block_size passed ({data_args.block_size}) is larger than the maximum length for the model"
-                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
-            )
-        block_size = min(data_args.block_size, tokenizer.model_max_length)
+
+        if model_args.target_modules:
+            target_modules = [m.strip() for m in model_args.target_modules.split(",") if m.strip()]
+        else:
+            # Broad default that matches by module name suffix across popular architectures
+            target_modules = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "up_proj",
+                "down_proj",
+                "gate_proj",
+                "c_attn",
+                "c_fc",
+                "c_proj",
+            ]
+
+        lora_config = LoraConfig(
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            lora_use_mixer=True,
+            target_modules=target_modules,
+            lora_dropout=model_args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+
+        # Compact summary of trainable parameters
+        try:
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            pct = 100.0 * trainable / max(total, 1)
+            logger.info(f"MoSLoRA enabled. Trainable params: {trainable}/{total} ({pct:.2f}%)")
+        except Exception:
+            pass
+
+    # --- Data Loading and Processing ---
+    train_dataset = None
+    eval_dataset = None
 
     if training_args.do_train:
-        if "train" not in tokenized_datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = tokenized_datasets["train"]
-        if data_args.max_train_samples is not None:
-            max_train_samples = min(len(train_dataset), data_args.max_train_samples)
-            train_dataset = train_dataset.select(range(max_train_samples))
+        if data_args.dataset_name:
+            # For pre-training, load a pre-processed dataset from disk
+            logger.info(f"Loading pre-processed dataset from {data_args.dataset_name}")
+            tokenized_datasets = load_from_disk(data_args.dataset_name, keep_in_memory=True)
+            train_dataset = tokenized_datasets["train"]
+
+        elif data_args.train_file:
+            # For SFT, load from a raw .json file and tokenize
+            logger.info(f"Loading and tokenizing SFT data from {data_args.train_file}")
+            raw_datasets = load_dataset("json", data_files={"train": data_args.train_file}, cache_dir=model_args.cache_dir)
+
+            if data_args.block_size is None:
+                block_size = tokenizer.model_max_length
+            else:
+                block_size = min(data_args.block_size, tokenizer.model_max_length)
+
+            def tokenize_function(examples):
+                return tokenizer(examples["text"]) # For SFT, we don't need padding here, DataCollator will handle it.
+
+            with training_args.main_process_first(desc="Running tokenizer on SFT dataset"):
+                tokenized_datasets = raw_datasets.map(
+                    tokenize_function,
+                    batched=True,
+                    num_proc=data_args.preprocessing_num_workers,
+                    remove_columns=raw_datasets["train"].column_names, # Remove all original columns
+                    load_from_cache_file=not data_args.overwrite_cache,
+                    desc="Running tokenizer on dataset",
+                )
+            train_dataset = tokenized_datasets["train"]
+
+        else:
+            raise ValueError("For training, you must provide either a `dataset_name` or a `train_file`.")
 
     if training_args.do_eval:
-        if "validation" not in tokenized_datasets:
-            raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = tokenized_datasets["validation"]
-        if data_args.max_eval_samples is not None:
-            max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
-            eval_dataset = eval_dataset.select(range(max_eval_samples))
+        # Evaluation logic here (can be added if needed)
+        pass
 
-        def preprocess_logits_for_metrics(logits, labels):
-            if isinstance(logits, tuple):
-                # Depending on the model and config, logits may contain extra tensors,
-                # like past_key_values, but logits always come first
-                logits = logits[0]
-            return logits.argmax(dim=-1)
+    # --- Initialize Trainer ---
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-        metric = evaluate.load("accuracy")
-
-        def compute_metrics(eval_preds):
-            preds, labels = eval_preds
-            # preds have the same shape as the labels, after the argmax(-1) has been calculated
-            # by preprocess_logits_for_metrics but we need to shift the labels
-            labels = labels[:, 1:].reshape(-1)
-            preds = preds[:, :-1].reshape(-1)
-            return metric.compute(predictions=preds, references=labels)
-
-    # Initialize our Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        # Data collator will default to DataCollatorWithPadding, so we change it.
-        data_collator=default_data_collator,
-        compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics
-        if training_args.do_eval and not is_torch_tpu_available()
-        else None,
-        callbacks=[EarlyStoppingCallback(model_args.early_stopping_patience)] if model_args.early_stopping_patience else None
+        data_collator=data_collator,
     )
 
-    # Training
+    # --- Training ---
     if training_args.do_train:
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+        trainer.save_model() 
 
         metrics = train_result.metrics
-
         max_train_samples = (
             data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
         )
@@ -446,36 +479,17 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # Evaluation
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-
-        metrics = trainer.evaluate()
-
-        max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
-        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
-        try:
-            perplexity = math.exp(metrics["eval_loss"])
-        except OverflowError:
-            perplexity = float("inf")
-        metrics["perplexity"] = perplexity
-
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-
+    # --- Final Actions ---
     kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-generation"}
     if data_args.dataset_name is not None:
-        kwargs["dataset_tags"] = data_args.dataset_name
-        if data_args.dataset_config_name is not None:
-            kwargs["dataset_args"] = data_args.dataset_config_name
-            kwargs["dataset"] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
-        else:
-            kwargs["dataset"] = data_args.dataset_name
+        kwargs["dataset"] = data_args.dataset_name
 
     if training_args.push_to_hub:
         trainer.push_to_hub(**kwargs)
     else:
         trainer.create_model_card(**kwargs)
+
+# --- END OF REPLACEMENT BLOCK ---
 
 
 def _mp_fn(index):
