@@ -16,15 +16,31 @@ import math
 from multiprocessing import Process, Queue
 import subprocess
 import shutil
+import sys
+
+# MoSLoRA integration: ensure the local customized PEFT is importable
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_PEFT_PATH = os.path.join(_BASE_DIR, "MosLora", "peft", "src")
+if os.path.isdir(_LOCAL_PEFT_PATH) and _LOCAL_PEFT_PATH not in sys.path:
+    sys.path.append(_LOCAL_PEFT_PATH)
+
+try:
+    from peft import PeftModel
+except Exception:
+    PeftModel = None
 
 
 @dataclass
 class ScriptArguments:
-    model_name_or_path: str = field(metadata={"help": ""})
+    model_name_or_path: str = field(metadata={"help": "Path to the model or PEFT adapter directory"})
     sketch_path: str = field(metadata={"help": ""})
     save_path: str = field(metadata={"help": ""})
     keep_cnt: int = field(metadata={"help": ""})
     target: str = field(metadata={"help": ""})
+    base_model_path: str = field(
+        default="/home/hangshuaihe/tlm/tlm_dataset/gen/gen_data/clm_gen_best_v100_v4",
+        metadata={"help": "Path to the base model (required when loading PEFT adapters)"}
+    )
 
     # device: str = field(default="cuda:0", metadata={"help": ""})
     allow_repeat: bool = field(default=True, metadata={"help": ""})
@@ -62,9 +78,21 @@ def gen_func(task, states, input, tokenizer, model, device, gen_kwargs):
     return [tokenizer.batch_decode(item) for item in response_list]
 
 
-def worker(err_queue, save_path_i, sketch_dic_list_i, gen_kwargs, tokenizer, model_name_or_path, device, allow_repeat, keep_cnt, is_build):
+def worker(err_queue, save_path_i, sketch_dic_list_i, gen_kwargs, tokenizer, model_name_or_path, base_model_path, device, allow_repeat, keep_cnt, is_build):
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name_or_path).to(device)
+        # Check if this is a PEFT adapter directory
+        adapter_config_path = os.path.join(model_name_or_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path) and PeftModel is not None:
+            # Load base model and apply PEFT adapter
+            print(f"Loading PEFT adapter from {model_name_or_path}")
+            print(f"Using base model from {base_model_path}")
+            base_model = AutoModelForCausalLM.from_pretrained(base_model_path)
+            model = PeftModel.from_pretrained(base_model, model_name_or_path)
+            model = model.to(device)
+        else:
+            # Standard model loading
+            print(f"Loading standard model from {model_name_or_path}")
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path).to(device)
         model.eval()
         builder = auto_scheduler.measure.LocalBuilder(timeout=30)
         if os.path.exists(save_path_i):
@@ -185,7 +213,7 @@ def main():
         # filelist.append(save_path_i)
         sketch_dic_list_i = sketch_dic_list[gpu_i*per_len : (gpu_i+1)*per_len]
         device = f'cuda:{gpu_i}'
-        p = Process(target=worker, args=(err_queue, save_path_i, sketch_dic_list_i, gen_kwargs, tokenizer, script_args.model_name_or_path, device, script_args.allow_repeat, script_args.keep_cnt, script_args.is_build))
+        p = Process(target=worker, args=(err_queue, save_path_i, sketch_dic_list_i, gen_kwargs, tokenizer, script_args.model_name_or_path, script_args.base_model_path, device, script_args.allow_repeat, script_args.keep_cnt, script_args.is_build))
         p.start()
         processes.append(p)
     for p in processes:

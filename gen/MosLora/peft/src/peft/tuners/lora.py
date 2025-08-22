@@ -152,9 +152,12 @@ class LoraModel(torch.nn.Module):
                 if not is_target_modules_in_base_model:
                     is_target_modules_in_base_model = True
                 parent, target, target_name = self._get_submodules(key)
+                # Work on a fresh copy of kwargs per target to avoid cross-pollution
+                base_kwargs = dict(kwargs)
                 bias = target.bias is not None
                 if loaded_in_8bit and isinstance(target, bnb.nn.Linear8bitLt):
-                    kwargs.update(
+                    kw8 = dict(base_kwargs)
+                    kw8.update(
                         {
                             "has_fp16_weights": target.state.has_fp16_weights,
                             "memory_efficient_backward": target.state.memory_efficient_backward,
@@ -163,27 +166,60 @@ class LoraModel(torch.nn.Module):
                         }
                     )
                     if self.peft_config.enable_lora is None:
-                        new_module = Linear8bitLt(target.in_features, target.out_features, bias=bias, **kwargs)
+                        new_module = Linear8bitLt(target.in_features, target.out_features, bias=bias, **kw8)
                     else:
-                        kwargs.update({"enable_lora": self.peft_config.enable_lora})
-                        new_module = MergedLinear8bitLt(target.in_features, target.out_features, bias=bias, **kwargs)
-                elif isinstance(target, torch.nn.Linear) and self.peft_config.enable_lora is None:
-                    new_module = Linear(target.in_features, target.out_features, bias=bias, **kwargs)
-                elif self.peft_config.enable_lora is not None:
-                    kwargs.update({"enable_lora": self.peft_config.enable_lora})
+                        kw8.update({"enable_lora": self.peft_config.enable_lora})
+                        new_module = MergedLinear8bitLt(target.in_features, target.out_features, bias=bias, **kw8)
+                elif isinstance(target, torch.nn.Linear) and (self.peft_config.enable_lora is None or target_name == "lm_head"):
+                    kw = dict(base_kwargs)
+                    kw.pop("enable_lora", None)
+                    new_module = Linear(target.in_features, target.out_features, bias=bias, **kw)
+                elif self.peft_config.enable_lora is None:
+                    # Handle case where enable_lora is None but target is not Linear
+                    # This can happen with Conv1D layers or other module types
                     if isinstance(target, Conv1D):
                         in_features, out_features = (
                             target.weight.ds_shape if hasattr(target.weight, "ds_shape") else target.weight.shape
                         )
+                        kw = dict(base_kwargs)
+                        kw.pop("enable_lora", None)
+                        kw["fan_in_fan_out"] = True
+                        new_module = Linear(in_features, out_features, bias=bias, **kw)
+                    else:
+                        # For other module types, skip them
+                        continue
+                elif self.peft_config.enable_lora is not None:
+                    kw = dict(base_kwargs)
+                    kw.update({"enable_lora": self.peft_config.enable_lora})
+                    # MergedLinear only fits fused projections (e.g., GPT-2 c_attn). For others, use Linear.
+                    # Drop mixer flag here; not applicable for merged or linear Conv1D paths.
+                    if "lora_use_mixer" in kw:
+                        kw.pop("lora_use_mixer", None)
+                    if isinstance(target, Conv1D):
+                        in_features, out_features = (
+                            target.weight.ds_shape if hasattr(target.weight, "ds_shape") else target.weight.shape
+                        )
+                        if target_name == "c_attn":
+                            # Use merged adapter for fused qkv
+                            kw["fan_in_fan_out"] = True
+                            new_module = MergedLinear(in_features, out_features, bias=bias, **kw)
+                        else:
+                            # Use simple Linear adapter for standalone Conv1D (e.g., c_proj)
+                            linear_kwargs = dict(kw)
+                            linear_kwargs.pop("enable_lora", None)
+                            linear_kwargs["fan_in_fan_out"] = True
+                            new_module = Linear(in_features, out_features, bias=bias, **linear_kwargs)
                     else:
                         in_features, out_features = target.in_features, target.out_features
-                        if kwargs["fan_in_fan_out"]:
+                        # Use simple Linear adapter for standard Linear layers (e.g., lm_head)
+                        linear_kwargs = dict(kw)
+                        linear_kwargs.pop("enable_lora", None)
+                        if linear_kwargs.get("fan_in_fan_out", False):
                             warnings.warn(
-                                "fan_in_fan_out is set to True but the target module is not a Conv1D. "
-                                "Setting fan_in_fan_out to False."
+                                "fan_in_fan_out is set to True but the target module is not a Conv1D. Setting fan_in_fan_out to False."
                             )
-                            kwargs["fan_in_fan_out"] = self.peft_config.fan_in_fan_out = False
-                    new_module = MergedLinear(in_features, out_features, bias=bias, **kwargs)
+                            linear_kwargs["fan_in_fan_out"] = self.peft_config.fan_in_fan_out = False
+                        new_module = Linear(in_features, out_features, bias=bias, **linear_kwargs)
                 self._replace_module(parent, target_name, new_module, target)
         if not is_target_modules_in_base_model:
             raise ValueError(
@@ -517,6 +553,11 @@ class MergedLinear(nn.Linear, LoraLayer):
 
     def forward(self, x: torch.Tensor):
         previous_dtype = x.dtype
+        # Ensure weight orientation is correct for Conv1D-style storage
+        weight = self.weight
+        if weight.dim() == 2 and weight.shape == (self.in_features, self.out_features):
+            weight = weight.transpose(0, 1)
+
         if self.disable_adapters:
             if self.r > 0 and self.merged and any(self.enable_lora):
                 delta_w = (
@@ -531,11 +572,11 @@ class MergedLinear(nn.Linear, LoraLayer):
                 delta_w = delta_w.to(self.weight.dtype)
                 self.weight.data -= transpose(self.zero_pad(delta_w * self.scaling), not self.fan_in_fan_out)
                 self.merged = False
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+            result = F.linear(x, weight, bias=self.bias)
         elif self.merged:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+            result = F.linear(x, weight, bias=self.bias)
         else:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+            result = F.linear(x, weight, bias=self.bias)
             if self.r > 0:
                 after_A = self.lora_A(self.lora_dropout(x.to(self.lora_A.weight.dtype)))
                 after_B = self.lora_B(after_A.transpose(-2, -1)).transpose(-2, -1)

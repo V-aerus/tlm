@@ -17,8 +17,9 @@ parser.add_argument("--logging_steps", type=int, default=10, help="Logging steps
 parser.add_argument("--overwrite_output_dir", action="store_true", help="Overwrite output directory.")
 parser.add_argument("--remove_unused_columns", action="store_true", help="Remove unused columns.")
 
-# MoSLoRA flags passthrough
-parser.add_argument("--use_moslora", action="store_true", help="Enable MoSLoRA via customized PEFT")
+# LoRA flags passthrough
+parser.add_argument("--use_lora", action="store_true", help="Enable LoRA fine-tuning (either standard LoRA or MoSLoRA)")
+parser.add_argument("--use_mixer", action="store_true", help="Enable MoSLoRA mixer (W matrix). If False, use standard LoRA without mixer")
 parser.add_argument("--lora_r", type=int, default=16)
 parser.add_argument("--lora_alpha", type=int, default=32)
 parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -28,6 +29,7 @@ parser.add_argument(
     default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj,c_attn,c_fc,c_proj",
     help="Comma-separated module suffixes to adapt",
 )
+parser.add_argument("--defuse_gpt2_attn", action="store_true", help="Split GPT-2 fused attention for MoSLoRA")
 args = parser.parse_args()
 
 # 设置 screen 命令和相关参数
@@ -59,11 +61,13 @@ CUDA_VISIBLE_DEVICES=0 python train_clm.py \
     --learning_rate={args.learning_rate} \
     --model_name_or_path={args.model_name_or_path} \
     --lr_scheduler_type={args.lr_scheduler_type} \
-    --use_moslora={'true' if args.use_moslora else 'false'} \
+    --use_lora={'true' if args.use_lora else 'false'} \
+    --use_mixer={'true' if args.use_mixer else 'false'} \
     --lora_r={args.lora_r} \
     --lora_alpha={args.lora_alpha} \
     --lora_dropout={args.lora_dropout} \
-    --target_modules={args.target_modules}
+    --target_modules={args.target_modules} \
+    {"--defuse_gpt2_attn" if args.defuse_gpt2_attn else ""}
 
 if [ $? -ne 0 ]; then
   curl https://diyi.site/ma\?text\=finish_run_train_clm_best_v100 --noproxy diyi.site

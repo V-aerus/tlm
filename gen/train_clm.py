@@ -138,8 +138,9 @@ class ModelArguments:
     )
     early_stopping_patience: Optional[int] = field(default=None, metadata={"help": ""})
 
-    # --- MoSLoRA/PEFT arguments ---
-    use_moslora: bool = field(default=False, metadata={"help": "Enable MoSLoRA via customized PEFT"})
+    # --- LoRA/PEFT arguments ---
+    use_lora: bool = field(default=False, metadata={"help": "Enable LoRA fine-tuning (either standard LoRA or MoSLoRA)"})
+    use_mixer: bool = field(default=False, metadata={"help": "Enable MoSLoRA mixer (W matrix). If False, use standard LoRA without mixer"})
     lora_r: Optional[int] = field(default=16, metadata={"help": "LoRA rank r"})
     lora_alpha: Optional[int] = field(default=32, metadata={"help": "LoRA alpha"})
     lora_dropout: Optional[float] = field(default=0.05, metadata={"help": "LoRA dropout"})
@@ -152,6 +153,8 @@ class ModelArguments:
             )
         },
     )
+    # Defuse GPT-2 fused attention to enable full MoSLoRA (mixer) on q/k/v
+    defuse_gpt2_attn: bool = field(default=False, metadata={"help": "Split GPT-2 fused c_attn into q_proj,k_proj,v_proj and convert c_proj to Linear for MoSLoRA"})
 
     def __post_init__(self):
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
@@ -360,39 +363,100 @@ def main():
     print("Config:", config)
     print("Model:", model)
 
-    # --- Optionally wrap with MoSLoRA (custom PEFT) ---
-    if model_args.use_moslora:
+    # --- Optionally defuse GPT-2 fused attention to enable MoSLoRA on q/k/v ---
+    def _convert_conv1d_to_linear(conv1d_module):
+        in_features, out_features = conv1d_module.weight.shape
+        linear = torch.nn.Linear(in_features, out_features, bias=conv1d_module.bias is not None)
+        with torch.no_grad():
+            linear.weight.copy_(conv1d_module.weight.T)
+            if conv1d_module.bias is not None:
+                linear.bias.copy_(conv1d_module.bias)
+        return linear
+
+    class DefusedQKVLinear(torch.nn.Module):
+        def __init__(self, conv1d_qkv):
+            super().__init__()
+            in_features, out_features_total = conv1d_qkv.weight.shape
+            assert out_features_total % 3 == 0
+            hidden = out_features_total // 3
+            # Create three Linear projections
+            self.q_proj = torch.nn.Linear(in_features, hidden, bias=conv1d_qkv.bias is not None)
+            self.k_proj = torch.nn.Linear(in_features, hidden, bias=conv1d_qkv.bias is not None)
+            self.v_proj = torch.nn.Linear(in_features, hidden, bias=conv1d_qkv.bias is not None)
+            # Initialize from fused Conv1D
+            with torch.no_grad():
+                W = conv1d_qkv.weight  # (in, 3*hidden)
+                b = conv1d_qkv.bias if conv1d_qkv.bias is not None else None
+                self.q_proj.weight.copy_(W[:, 0:hidden].T)
+                self.k_proj.weight.copy_(W[:, hidden:2*hidden].T)
+                self.v_proj.weight.copy_(W[:, 2*hidden:3*hidden].T)
+                if b is not None:
+                    self.q_proj.bias.copy_(b[0:hidden])
+                    self.k_proj.bias.copy_(b[hidden:2*hidden])
+                    self.v_proj.bias.copy_(b[2*hidden:3*hidden])
+
+        def forward(self, x):
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+            return torch.cat([q, k, v], dim=2)
+
+    is_gpt2 = getattr(config, "model_type", None) == "gpt2"
+    if model_args.use_lora and model_args.defuse_gpt2_attn and is_gpt2:
+        for name, module in list(model.named_modules()):
+            # Replace fused qkv
+            if name.endswith("attn") and hasattr(module, "c_attn"):
+                setattr(module, "c_attn", DefusedQKVLinear(module.c_attn))
+            # Replace c_proj to Linear to allow mixer path
+            if name.endswith("attn") and hasattr(module, "c_proj"):
+                setattr(module, "c_proj", _convert_conv1d_to_linear(module.c_proj))
+            # Replace MLP projections to Linear to enable mixer path cleanly
+            if name.endswith("mlp"):
+                if hasattr(module, "c_fc"):
+                    setattr(module, "c_fc", _convert_conv1d_to_linear(module.c_fc))
+                if hasattr(module, "c_proj"):
+                    setattr(module, "c_proj", _convert_conv1d_to_linear(module.c_proj))
+
+    # --- Optionally wrap with LoRA (standard or MoSLoRA) ---
+    if model_args.use_lora:
         if LoraConfig is None or get_peft_model is None:
             raise ImportError(
-                "MoSLoRA requested but custom PEFT could not be imported. Ensure 'MosLora/peft/src' exists."
+                "LoRA requested but custom PEFT could not be imported. Ensure 'MosLora/peft/src' exists."
             )
 
         if model_args.target_modules:
             target_modules = [m.strip() for m in model_args.target_modules.split(",") if m.strip()]
         else:
-            # Broad default that matches by module name suffix across popular architectures
-            target_modules = [
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "up_proj",
-                "down_proj",
-                "gate_proj",
-                "c_attn",
-                "c_fc",
-                "c_proj",
-            ]
+            # Prefer Linear names after defusion; otherwise use fused names
+            if getattr(config, "model_type", None) == "gpt2" and model_args.defuse_gpt2_attn:
+                # Use attention-specific suffix for c_proj to avoid matching MLP.c_proj
+                target_modules = ["q_proj", "k_proj", "v_proj", "attn.c_proj"]
+            elif getattr(config, "model_type", None) == "gpt2":
+                target_modules = ["c_attn", "c_proj"]
+            else:
+                target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-        lora_config = LoraConfig(
+        # Build LoRA config, special-casing GPT-2 Conv1D modules to use merged LoRA
+        lora_kwargs = dict(
             r=model_args.lora_r,
             lora_alpha=model_args.lora_alpha,
-            lora_use_mixer=True,
             target_modules=target_modules,
             lora_dropout=model_args.lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
         )
+        if getattr(config, "model_type", None) == "gpt2":
+            if model_args.defuse_gpt2_attn:
+                # Use the explicit use_mixer flag to distinguish between standard LoRA and MoSLoRA
+                lora_kwargs["lora_use_mixer"] = model_args.use_mixer
+            else:
+                # Fused path: enable merged LoRA (q,k,v)
+                lora_kwargs["enable_lora"] = [True, True, True]
+        else:
+            # For non-GPT-2, use the explicit use_mixer flag
+            lora_kwargs["lora_use_mixer"] = model_args.use_mixer
+
+        lora_config = LoraConfig(**lora_kwargs)
         model = get_peft_model(model, lora_config)
 
         # Compact summary of trainable parameters
@@ -400,7 +464,8 @@ def main():
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in model.parameters())
             pct = 100.0 * trainable / max(total, 1)
-            logger.info(f"MoSLoRA enabled. Trainable params: {trainable}/{total} ({pct:.2f}%)")
+            lora_type = "MoSLoRA" if model_args.use_mixer else "Standard LoRA"
+            logger.info(f"{lora_type} enabled. Trainable params: {trainable}/{total} ({pct:.2f}%)")
         except Exception:
             pass
 
@@ -467,7 +532,20 @@ def main():
             checkpoint = last_checkpoint
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model() 
+        
+        # --- START OF FINAL FIX ---
+        # Manually save the PEFT adapter in the correct format.
+        # This will create adapter_model.bin and adapter_config.json.
+        if model_args.use_lora:
+            logger.info("Manually saving PEFT adapter...")
+            model.save_pretrained(training_args.output_dir)
+            # We also need to save the tokenizer for convenience
+            tokenizer.save_pretrained(training_args.output_dir)
+            logger.info(f"PEFT adapter and tokenizer saved to {training_args.output_dir}")
+        else:
+            # For non-PEFT models, use the standard trainer save
+            trainer.save_model()
+        # --- END OF FINAL FIX ---
 
         metrics = train_result.metrics
         max_train_samples = (
