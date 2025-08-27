@@ -2,9 +2,9 @@
 
 #    --model_name_or_path /home/hangshuaihe/tlm/tlm_dataset/gen/gen_data/clm_gen_best_xavier_v${BASE_MODEL_VERSION} \
 # --- Iteration 2: Training v2 from v1 ---
-BASE_MODEL_VERSION="4"
-NEW_MODEL_VERSION="5"
-TRAIN_DATA_VERSION="5"
+BASE_MODEL_VERSION="5"
+NEW_MODEL_VERSION="6"
+TRAIN_DATA_VERSION="6"
 
 echo "Starting SFT for Xavier: Training v${NEW_MODEL_VERSION} from v${BASE_MODEL_VERSION}"
 
