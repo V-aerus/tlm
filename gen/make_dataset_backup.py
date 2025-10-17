@@ -156,15 +156,11 @@ def for_gen_best(lines):
     from common import HARDWARE_PLATFORM
     if HARDWARE_PLATFORM == 'i7':
         data_list_new = data_list_new[:1]
-    elif HARDWARE_PLATFORM in ('v100', 'xavier', '4090', 'xeon'):
-        # 默认策略（不限制数量），与 v100 一致
-        pass
-    elif HARDWARE_PLATFORM == 'multi':
-        # 对于 multi 平台，使用默认策略（不限制数量）
+    elif HARDWARE_PLATFORM == 'v100':
+        # data_list_new = data_list_new[:2]
         pass
     else:
-        # 未知平台也不过滤，避免中断
-        pass
+        assert(False)
 
     return data_list_new
 
@@ -297,34 +293,8 @@ def main():
 
     # Load task registry
     print("Load all tasks...")
-    
-    # 智能映射multi target到具体硬件
-    original_target = script_args.target
-    if script_args.target.lower() == 'multi':
-        # 从dataset_path中提取硬件名称
-        dataset_path = script_args.dataset_path
-        if '/measure_records/v100' in dataset_path:
-            actual_target = 'nvidia/nvidia-v100'
-        elif '/measure_records/xavier' in dataset_path:
-            actual_target = 'nvidia/jetson-agx-xavier'
-        elif '/measure_records/4090' in dataset_path:
-            actual_target = 'cuda -keys=cuda,gpu -arch=sm_86 -max_num_threads=1024 -model=4090 -thread_warp_size=32'
-        elif '/measure_records/xeon' in dataset_path:
-            actual_target = 'llvm -mcpu=skylake-avx512 -model=xeon'
-        else:
-            raise ValueError(f"Cannot determine actual target from dataset_path: {dataset_path}")
-        
-        print(f"Multi target detected, mapping to: {actual_target}")
-        print(f"Using network info from: multi")
-        print(f"Using dataset from: {os.path.basename(dataset_path)}")
-        
-        # 使用multi作为网络信息路径，但actual_target作为TVM target
-        register_data_path('multi')  # 强制使用multi的网络信息
-        script_args.target = tvm.target.Target(actual_target)
-    else:
-        register_data_path(script_args.target)
-        script_args.target = tvm.target.Target(script_args.target)
-    
+    register_data_path(script_args.target)
+    script_args.target = tvm.target.Target(script_args.target)
     tasks = load_and_register_tasks()
 
     if script_args.for_type == FOR_GEN_TOKENIZER:
@@ -373,18 +343,12 @@ def main():
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
         files.sort()
         print("Dataset file cnt:", len(files))
-        
-        # 在multi模式下跳过hold out，因为multi网络信息的hold out文件路径与具体硬件目录不匹配
-        if original_target.lower() != 'multi':
-            hold_out_files = get_hold_out_five_files(script_args.target)
-            for out in hold_out_files:
-                for file in files:
-                    if os.path.basename(out) == os.path.basename(file):
-                        files.remove(file)
-            print("After hold out, file cnt:", len(files))
-        else:
-            print("Skipping hold out for multi target")
-            print("After hold out (skipped), file cnt:", len(files))
+        hold_out_files = get_hold_out_five_files(script_args.target)
+        for out in hold_out_files:
+            for file in files:
+                if os.path.basename(out) == os.path.basename(file):
+                    files.remove(file)
+        print("After hold out, file cnt:", len(files))
         if script_args.file_cnt:
             set_seed(0)
             files = random.sample(files, script_args.file_cnt)

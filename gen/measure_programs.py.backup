@@ -77,32 +77,20 @@ def main(args):
         with open(args.measured_path, 'r') as f:
             lines = f.read().strip().split('\n')
         for line in lines:
-            if line.strip():  # 只处理非空行
-                try:
-                    inp_str = json.dumps(json.loads(line)['i'])
-                    measured_set.add(inp_str)
-                except (json.JSONDecodeError, KeyError) as e:
-                    print(f"警告：跳过无效的测量结果行: {line[:100]}... 错误: {e}")
-                    continue
+            inp_str = json.dumps(json.loads(line)['i'])
+            measured_set.add(inp_str)
 
     to_measure_list = []
     with open(args.to_measure_path, 'r') as f:
         lines = f.read().strip().split('\n')
-    
-    # 修复：不要清空测量结果文件，保留已有的测量结果
-    # with open(args.measured_path, 'w') as f:
-    #     pass
-    
+    with open(args.measured_path, 'w') as f:
+        pass
     for line in lines:
-        if line.strip():  # 只处理非空行
-            try:
-                inp_str = json.dumps(json.loads(line)['i'])
-                if inp_str in measured_set:
-                    continue
-                to_measure_list.append(line)
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"警告：跳过无效的JSON行: {line[:100]}... 错误: {e}")
+        if line:
+            inp_str = json.dumps(json.loads(line)['i'])
+            if inp_str in measured_set:
                 continue
+            to_measure_list.append(line)
     
     # inputs, _ = auto_scheduler.RecordReader(args.to_measure_path).read_lines()
     input_dict = {}
@@ -116,12 +104,8 @@ def main(args):
     end_idx = min(args.end_idx, len(tasks))
 
     print("len input_dict:", len(input_dict))
-    print(f"已测量记录数: {len(measured_set)}")
-    print(f"待测量记录数: {len(to_measure_list)}")
-    
-    if len(to_measure_list) == 0:
-        print("所有记录都已测量，无需重新测量")
-        return
+    # if os.path.exists(args.measured_path):
+    #     os.remove(args.measured_path)
 
     # Remeasure all tasks
     for task_i, (workload_key, (task, records)) in enumerate(input_dict.items()):

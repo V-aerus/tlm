@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_from_disk
+from torch.utils.data import BatchSampler
 
 import transformers
 from transformers import (
@@ -165,7 +166,7 @@ class ModelArguments:
     
     # Hardware types configuration
     hardware_types: Optional[str] = field(
-        default="v100,xavier,i7",
+        default="high_perf_gpu,edge_gpu,cpu_group",
         metadata={"help": "Comma-separated hardware types for HS experts"}
     )
     
@@ -331,19 +332,32 @@ class MTMoSLoRALinear(nn.Module):
         return moslora_module
     
     def _build_hardware_router(self) -> Dict[str, str]:
-        """Build hardware routing dictionary"""
+        """Build hardware routing dictionary with grouping strategy"""
         return {
-            'nvidia/nvidia-v100': 'v100',
-            'nvidia/jetson-agx-xavier': 'xavier', 
-            'intel/i7': 'i7',
-            'v100': 'v100',
-            'xavier': 'xavier',
-            'i7': 'i7'
+            # 高性能GPU组
+            'nvidia/nvidia-v100': 'high_perf_gpu',
+            'nvidia/rtx-4090': 'high_perf_gpu',
+            'v100': 'high_perf_gpu',
+            '4090': 'high_perf_gpu',
+            'high_perf_gpu': 'high_perf_gpu',
+            
+            # 边缘GPU组
+            'nvidia/jetson-agx-xavier': 'edge_gpu',
+            'xavier': 'edge_gpu',
+            'edge_gpu': 'edge_gpu',
+            
+        # CPU组
+        'intel/i7': 'cpu_group',
+        'intel/xeon': 'cpu_group',
+        'i7': 'cpu_group',
+        'xeon': 'cpu_group',
+        'cpu': 'cpu_group',
+        'cpu_group': 'cpu_group'
         }
     
     def route_hardware(self, hardware_id: str) -> str:
         """Route hardware_id to internal hardware type"""
-        return self.hardware_router.get(hardware_id, 'v100')  # default to v100
+        return self.hardware_router.get(hardware_id, 'high_perf_gpu')  # default to high_perf_gpu
     
     def forward(self, x: torch.Tensor, hardware_id: str = None):
         """
@@ -364,8 +378,14 @@ class MTMoSLoRALinear(nn.Module):
         
         # HS (Hardware-Specific) adaptation - only for specific hardware
         hs_delta = torch.zeros_like(base_output)
-        if hardware_id is not None:
-            hw_type = self.route_hardware(hardware_id)
+        
+        # 获取硬件ID：优先使用传入参数，其次使用模型全局设置
+        current_hw_id = hardware_id
+        if current_hw_id is None and hasattr(self, 'current_hardware_id'):
+            current_hw_id = self.current_hardware_id
+        
+        if current_hw_id is not None:
+            hw_type = self.route_hardware(current_hw_id)
             if hw_type in self.hs_experts:
                 hs_delta = self.hs_experts[hw_type](x)
         
@@ -542,31 +562,154 @@ def apply_mt_moslora_to_model(model: nn.Module, model_args: ModelArguments) -> n
 def extract_hardware_id_function(example):
     """
     从 text 字段中解析硬件信息，并添加 'hardware_id' 字段
+    使用硬件分组策略：高性能GPU、边缘GPU、CPU
     """
-    text_data = example['text']
+    text_data = example['text'].lower()
     
-    # 硬件检测规则
-    if "sm_70" in text_data or "v100" in text_data.lower():
-        example['hardware_id'] = 'v100'
-    elif "xavier" in text_data.lower() or "jetson" in text_data.lower():
-        example['hardware_id'] = 'xavier'
-    elif "i7" in text_data.lower() or "intel" in text_data.lower():
-        example['hardware_id'] = 'i7'
+    # 硬件检测规则（按优先级排序，支持分组）
+    if "sm_70" in text_data or "v100" in text_data or "4090" in text_data or "sm_86" in text_data:
+        # 高性能GPU组：V100 + RTX4090
+        example['hardware_id'] = 'high_perf_gpu'
+    elif "xavier" in text_data or "jetson" in text_data or "sm_72" in text_data:
+        # 边缘GPU组：Xavier
+        example['hardware_id'] = 'edge_gpu'
+    elif "xeon" in text_data or "skylake" in text_data or "i7" in text_data or "intel" in text_data:
+        # CPU组：i7 + Xeon
+        example['hardware_id'] = 'cpu_group'
     else:
         # 默认硬件类型
-        example['hardware_id'] = 'v100'
+        example['hardware_id'] = 'high_perf_gpu'
         
     return example
+
+
+class GroupedBatchSampler(BatchSampler):
+    """
+    自定义 BatchSampler，按 hardware_id 分组采样，确保每个 batch 只含同一 hardware_id。
+    在组边界，如果剩余样本 < batch_size，用小 batch。
+    """
+    def __init__(self, dataset, batch_size, drop_last=False):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.groups = self._group_by_hardware_id()  # 计算分组边界
+
+    def _group_by_hardware_id(self):
+        """计算每个 hardware_id 的 start/end indices（假设数据集已 sort）"""
+        groups = {}
+        current_id = None
+        start_idx = 0
+        for idx, example in enumerate(self.dataset):
+            hw_id = example['hardware_id']
+            if hw_id != current_id:
+                if current_id is not None:
+                    groups[current_id] = (start_idx, idx)  # end 是 exclusive
+                current_id = hw_id
+                start_idx = idx
+        if current_id is not None:
+            groups[current_id] = (start_idx, len(self.dataset))
+        logger.info(f"Grouped by hardware_id: { {k: (end - start) for k, (start, end) in groups.items()} }")
+        return groups
+
+    def __iter__(self):
+        for hw_id, (start, end) in self.groups.items():
+            group_indices = list(range(start, end))
+            # Sequential 在组内
+            for i in range(0, len(group_indices), self.batch_size):
+                batch_indices = group_indices[i:i + self.batch_size]
+                if len(batch_indices) < self.batch_size and self.drop_last:
+                    continue  # 丢弃小 batch，如果 drop_last=True
+                yield batch_indices  # 返回 indices list，动态 size 如果边界
+
+    def __len__(self):
+        total = 0
+        for _, (start, end) in self.groups.items():
+            num_batches = (end - start) // self.batch_size
+            if not self.drop_last and (end - start) % self.batch_size > 0:
+                num_batches += 1
+            total += num_batches
+        return total
+
+
+class HardwareAwareCollator(DataCollatorForLanguageModeling):
+    """硬件感知的数据收集器，确保batch内hardware_id一致"""
+    def __call__(self, features):
+        # 从 features pop hardware_id，避免 tokenizer.pad 处理它
+        hardware_ids = []
+        for f in features:
+            if 'hardware_id' in f:
+                hardware_ids.append(f.pop('hardware_id'))  # pop 移除，str scalar
+        
+        # 调试：打印batch的hardware_ids分布（减少日志频率）
+        if len(set(hardware_ids)) > 1:  # 只在出现混合时打印详细信息
+            logger.warning(f"⚠️  Mixed hardware_ids detected: {hardware_ids} -> {set(hardware_ids)}")
+        
+        # 检查混合（现在 hardware_ids 是 list[str]）
+        if len(set(hardware_ids)) > 1:
+            raise ValueError(f"Batch has mixed hardware_ids: {set(hardware_ids)}! "
+                           f"Please sort dataset by hardware_id or use smaller batch size.")
+        
+        # 调用 super 处理剩余 numerical fields（如 input_ids）
+        batch = super().__call__(features)
+        
+        # 加回 hardware_id（list[str]，用于 Trainer）
+        if hardware_ids:
+            batch['hardware_id'] = hardware_ids
+            
+        return batch
 
 
 class HardwareAwareTrainer(transformers.Trainer):
     """
     硬件感知的训练器，在每个训练步骤中传递hardware_id
     """
+    def get_train_dataloader(self):
+        from torch.utils.data import DataLoader
+        
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        # 使用自定义 GroupedBatchSampler，确保不混合 hardware_id
+        batch_sampler = GroupedBatchSampler(
+            self.train_dataset,
+            batch_size=self._train_batch_size,
+            drop_last=self.args.dataloader_drop_last  # 来自 args，通常 False
+        )
+
+        return DataLoader(
+            self.train_dataset,
+            batch_sampler=batch_sampler,  # 用 batch_sampler 替换 sampler
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
     def training_step(self, model, inputs):
         # 从数据中获取hardware_id并设置到模型上
         if 'hardware_id' in inputs:
-            model.current_hardware_id = inputs['hardware_id'][0] if isinstance(inputs['hardware_id'], list) else inputs['hardware_id']
+            hw_ids = inputs['hardware_id']
+            if not hw_ids:  # 空batch检查
+                logger.warning("Empty hardware_ids in batch, skipping HS activation")
+                model.current_hardware_id = None
+            else:
+                unique_hw = set(hw_ids)
+                if len(unique_hw) != 1:
+                    raise ValueError(f"Mixed hardware_ids in batch: {unique_hw} despite collator check!")
+                
+                hardware_id = hw_ids[0]
+                model.current_hardware_id = hardware_id
+                
+                # 同时设置到所有MT-MoSLoRA模块上
+                for name, module in model.named_modules():
+                    if isinstance(module, MTMoSLoRALinear):
+                        module.current_hardware_id = hardware_id
+                
+                # 添加调试日志
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Batch hardware_id: {hardware_id}")
+            
+            # 从inputs中移除hardware_id，避免传递给模型forward方法
+            inputs = {k: v for k, v in inputs.items() if k != 'hardware_id'}
         
         return super().training_step(model, inputs)
 
@@ -758,18 +901,28 @@ def main():
                 block_size = min(data_args.block_size, tokenizer.model_max_length)
 
             def tokenize_function(examples):
-                return tokenizer(examples["text"])
+                tokenized = tokenizer(examples["text"])
+                # 保留hardware_id字段
+                tokenized['hardware_id'] = examples['hardware_id']
+                # 移除不需要的字段，避免tokenizer处理错误
+                return tokenized
 
             with training_args.main_process_first(desc="Running tokenizer on SFT dataset"):
                 tokenized_datasets = raw_datasets.map(
                     tokenize_function,
                     batched=True,
                     num_proc=data_args.preprocessing_num_workers,
-                    remove_columns=raw_datasets["train"].column_names,
+                    remove_columns=['text', 'line', 'latency', 'labels'],  # 移除不需要的列，只保留hardware_id
                     load_from_cache_file=not data_args.overwrite_cache,
                     desc="Running tokenizer on dataset",
                 )
-            train_dataset = tokenized_datasets["train"]
+            
+            # 按hardware_id排序数据集，确保batch内hardware_id一致
+            train_dataset = tokenized_datasets["train"].sort('hardware_id')
+            
+            # 调试：检查数据格式
+            logger.info(f"Sample data after tokenization: {train_dataset[0]}")
+            logger.info(f"hardware_id type: {type(train_dataset[0]['hardware_id'])}")  # 应为 str
 
         else:
             raise ValueError("For training, you must provide either a `dataset_name` or a `train_file`.")
@@ -780,7 +933,7 @@ def main():
         pass
 
     # 初始化训练器
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    data_collator = HardwareAwareCollator(tokenizer=tokenizer, mlm=False)
 
     # 对于MT-MoSLoRA，禁用Trainer的自动模型保存，我们使用自定义保存逻辑
     if model_args.use_mt_moslora:

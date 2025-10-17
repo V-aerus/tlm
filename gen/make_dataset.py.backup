@@ -21,6 +21,9 @@ from tvm.auto_scheduler.measure import MeasureInput
 import numpy as np
 import math
 
+# 全局统计变量
+SKIPPED_FILES_COUNT = 0
+TOTAL_FILES_COUNT = 0
 
 FOR_GEN_TOKENIZER = "for_gen_tokenizer"
 FOR_LATENCY = "for_latency"
@@ -60,8 +63,15 @@ def for_clm_or_mlm(for_type):
 
 
 def for_gen(lines):
-    input, _ = load_record_from_string(lines[0])
-    compute_dag = auto_scheduler.measure.recover_measure_input(input).task.compute_dag.print_min()
+    global SKIPPED_FILES_COUNT
+    try:
+        input, _ = load_record_from_string(lines[0])
+        compute_dag = auto_scheduler.measure.recover_measure_input(input).task.compute_dag.print_min()
+    except Exception as e:
+        # 统计跳过的文件
+        SKIPPED_FILES_COUNT += 1
+        print(f"Warning: Skipping file due to TVM workload registry error: {e}")
+        return []  # 返回空列表，跳过这个文件
 
     data_list = []
     latency_min = 1e10
@@ -96,10 +106,17 @@ def for_gen(lines):
 
 
 def for_gen_best(lines):
-    input, _ = load_record_from_string(lines[0])
-    task = auto_scheduler.measure.recover_measure_input(input).task
-    compute_dag = task.compute_dag.print_min()
-    workload_key = task.workload_key
+    global SKIPPED_FILES_COUNT
+    try:
+        input, _ = load_record_from_string(lines[0])
+        task = auto_scheduler.measure.recover_measure_input(input).task
+        compute_dag = task.compute_dag.print_min()
+        workload_key = task.workload_key
+    except Exception as e:
+        # 统计跳过的文件
+        SKIPPED_FILES_COUNT += 1
+        print(f"Warning: Skipping file due to TVM workload registry error: {e}")
+        return []  # 返回空列表，跳过这个文件
 
     ppt_str_min = {}
     latency_min = 1e10
@@ -156,15 +173,11 @@ def for_gen_best(lines):
     from common import HARDWARE_PLATFORM
     if HARDWARE_PLATFORM == 'i7':
         data_list_new = data_list_new[:1]
-    elif HARDWARE_PLATFORM in ('v100', 'xavier', '4090', 'xeon'):
-        # 默认策略（不限制数量），与 v100 一致
-        pass
-    elif HARDWARE_PLATFORM == 'multi':
-        # 对于 multi 平台，使用默认策略（不限制数量）
+    elif HARDWARE_PLATFORM == 'v100':
+        # data_list_new = data_list_new[:2]
         pass
     else:
-        # 未知平台也不过滤，避免中断
-        pass
+        assert(False)
 
     return data_list_new
 
@@ -174,10 +187,17 @@ def softmax(x, temperature=1.0):
     return e_x / e_x.sum(axis=0)
 
 def for_gen_eval_sketch(lines, keep_cnt, for_type):
-    input, _ = load_record_from_string(lines[0])
-    task = auto_scheduler.measure.recover_measure_input(input).task
-    compute_dag = task.compute_dag.print_min()
-    workload_key = task.workload_key
+    global SKIPPED_FILES_COUNT
+    try:
+        input, _ = load_record_from_string(lines[0])
+        task = auto_scheduler.measure.recover_measure_input(input).task
+        compute_dag = task.compute_dag.print_min()
+        workload_key = task.workload_key
+    except Exception as e:
+        # 统计跳过的文件
+        SKIPPED_FILES_COUNT += 1
+        print(f"Warning: Skipping file due to TVM workload registry error: {e}")
+        return []  # 返回空列表，跳过这个文件
 
     json_line_dict = {}
     for line in lines:
@@ -258,21 +278,34 @@ def process_file(args, tmp_folder, for_type, keep_cnt):
     print(file_i, end="    \r", flush=True)
     with open(file, "r") as f:
         lines = f.read().strip().split("\n")
+    
+    skipped = False
     if for_type == FOR_GEN_TOKENIZER or for_type == FOR_GEN or for_type == FOR_LATENCY:
         data_list = for_gen(lines)
-        data_list = json_to_token(data_list)
+        if len(data_list) == 0:  # 如果返回空列表，说明跳过了
+            skipped = True
+        else:
+            data_list = json_to_token(data_list)
     elif for_type == FOR_GEN_BEST or for_type == FOR_GEN_BEST_ALL:
         data_list = for_gen_best(lines)
-        data_list = json_to_token(data_list)
+        if len(data_list) == 0:  # 如果返回空列表，说明跳过了
+            skipped = True
+        else:
+            data_list = json_to_token(data_list)
     elif for_type == FOR_GEN_EVAL_SKETCH or for_type == FOR_GEN_TRAIN_SKETCH or for_type == FOR_GEN_EVALTUNING_SKETCH or for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
         data_list = for_gen_eval_sketch(lines, keep_cnt, for_type)
+        if len(data_list) == 0:  # 如果返回空列表，说明跳过了
+            skipped = True
     else:
         assert(False)
 
-    with open(f"{tmp_folder}/{file_i}_part", "w") as f:
-        for data in data_list:
-            json.dump(data, f)
-            f.write("\n")
+    if not skipped:  # 只有在没有跳过的情况下才写入文件
+        with open(f"{tmp_folder}/{file_i}_part", "w") as f:
+            for data in data_list:
+                json.dump(data, f)
+                f.write("\n")
+    
+    return skipped  # 返回是否跳过了这个文件
 
 
 def token_files_and_merge(for_type, files, save_path, keep_cnt=None):
@@ -282,49 +315,32 @@ def token_files_and_merge(for_type, files, save_path, keep_cnt=None):
     if os.path.exists(tmp_folder):
         shutil.rmtree(tmp_folder)
     os.makedirs(tmp_folder)
+    
+    # 使用map收集结果
     with Pool(os.cpu_count()) as pool:
-        pool.map(partial(process_file, tmp_folder=tmp_folder, for_type=for_type, keep_cnt=keep_cnt), enumerate(files))
+        results = pool.map(partial(process_file, tmp_folder=tmp_folder, for_type=for_type, keep_cnt=keep_cnt), enumerate(files))
+    
+    # 统计跳过的文件数
+    skipped_count = sum(results)
+    
     print()
     subprocess.run(f"cat {tmp_folder}/*_part > {filename}", shell=True)
     shutil.rmtree(tmp_folder)
-    return filename
+    
+    # 返回文件名和跳过的文件数
+    return filename, skipped_count
 
 
 def main():
+    global SKIPPED_FILES_COUNT, TOTAL_FILES_COUNT
     parser = HfArgumentParser(ScriptArguments)
     script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
     print(script_args)
 
     # Load task registry
     print("Load all tasks...")
-    
-    # 智能映射multi target到具体硬件
-    original_target = script_args.target
-    if script_args.target.lower() == 'multi':
-        # 从dataset_path中提取硬件名称
-        dataset_path = script_args.dataset_path
-        if '/measure_records/v100' in dataset_path:
-            actual_target = 'nvidia/nvidia-v100'
-        elif '/measure_records/xavier' in dataset_path:
-            actual_target = 'nvidia/jetson-agx-xavier'
-        elif '/measure_records/4090' in dataset_path:
-            actual_target = 'cuda -keys=cuda,gpu -arch=sm_86 -max_num_threads=1024 -model=4090 -thread_warp_size=32'
-        elif '/measure_records/xeon' in dataset_path:
-            actual_target = 'llvm -mcpu=skylake-avx512 -model=xeon'
-        else:
-            raise ValueError(f"Cannot determine actual target from dataset_path: {dataset_path}")
-        
-        print(f"Multi target detected, mapping to: {actual_target}")
-        print(f"Using network info from: multi")
-        print(f"Using dataset from: {os.path.basename(dataset_path)}")
-        
-        # 使用multi作为网络信息路径，但actual_target作为TVM target
-        register_data_path('multi')  # 强制使用multi的网络信息
-        script_args.target = tvm.target.Target(actual_target)
-    else:
-        register_data_path(script_args.target)
-        script_args.target = tvm.target.Target(script_args.target)
-    
+    register_data_path(script_args.target)
+    script_args.target = tvm.target.Target(script_args.target)
     tasks = load_and_register_tasks()
 
     if script_args.for_type == FOR_GEN_TOKENIZER:
@@ -335,7 +351,19 @@ def main():
             set_seed(0)
             files = random.sample(files, script_args.file_cnt)
             print("Sampled file cnt:", len(files))
-        filename = token_files_and_merge(script_args.for_type, files, script_args.tokenizer_path)
+        
+        # 初始化统计变量
+        TOTAL_FILES_COUNT = len(files)
+        
+        filename, skipped_count = token_files_and_merge(script_args.for_type, files, script_args.tokenizer_path)
+        
+        # 输出统计信息
+        print(f"\n=== 处理统计 ===")
+        print(f"总文件数: {TOTAL_FILES_COUNT}")
+        print(f"跳过文件数: {skipped_count}")
+        print(f"成功处理文件数: {TOTAL_FILES_COUNT - skipped_count}")
+        print(f"跳过率: {skipped_count/TOTAL_FILES_COUNT*100:.2f}%")
+        print(f"================\n")
         train_tokenizer([filename], script_args.tokenizer_path, test_length=True)
     elif script_args.for_type == FOR_GEN:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
@@ -351,7 +379,19 @@ def main():
             set_seed(0)
             files = random.sample(files, script_args.file_cnt)
             print("Sampled file cnt:", len(files))
-        filename = token_files_and_merge(script_args.for_type, files, script_args.save_path)
+        
+        # 初始化统计变量
+        TOTAL_FILES_COUNT = len(files)
+        
+        filename, skipped_count = token_files_and_merge(script_args.for_type, files, script_args.save_path)
+        
+        # 输出统计信息
+        print(f"\n=== 处理统计 ===")
+        print(f"总文件数: {TOTAL_FILES_COUNT}")
+        print(f"跳过文件数: {skipped_count}")
+        print(f"成功处理文件数: {TOTAL_FILES_COUNT - skipped_count}")
+        print(f"跳过率: {skipped_count/TOTAL_FILES_COUNT*100:.2f}%")
+        print(f"================\n")
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type))
     elif script_args.for_type == FOR_LATENCY:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
@@ -373,18 +413,12 @@ def main():
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
         files.sort()
         print("Dataset file cnt:", len(files))
-        
-        # 在multi模式下跳过hold out，因为multi网络信息的hold out文件路径与具体硬件目录不匹配
-        if original_target.lower() != 'multi':
-            hold_out_files = get_hold_out_five_files(script_args.target)
-            for out in hold_out_files:
-                for file in files:
-                    if os.path.basename(out) == os.path.basename(file):
-                        files.remove(file)
-            print("After hold out, file cnt:", len(files))
-        else:
-            print("Skipping hold out for multi target")
-            print("After hold out (skipped), file cnt:", len(files))
+        hold_out_files = get_hold_out_five_files(script_args.target)
+        for out in hold_out_files:
+            for file in files:
+                if os.path.basename(out) == os.path.basename(file):
+                    files.remove(file)
+        print("After hold out, file cnt:", len(files))
         if script_args.file_cnt:
             set_seed(0)
             files = random.sample(files, script_args.file_cnt)

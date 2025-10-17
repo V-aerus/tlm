@@ -72,3 +72,10 @@ def get_measure_records():
         return []
     print("No measure_records found for HARDWARE_PLATFORM")
     return []
+
+def add_measure_records(file):
+    """添加测量记录文件到utils.json"""
+    tmp_list = get_utils_json('measure_records')
+    if file not in tmp_list:
+        tmp_list.append(file)
+    save_utils_json()

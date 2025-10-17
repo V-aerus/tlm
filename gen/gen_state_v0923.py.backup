@@ -18,7 +18,6 @@ from multiprocessing import Process, Queue
 import subprocess
 import shutil
 import sys
-import glob
 
 # MoSLoRA integration: ensure the local customized PEFT is importable
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -367,60 +366,6 @@ def set_target_hardware(model, target_hardware):
             module.set_active_hardware(target_hardware)
 
 
-def merge_json_files_safely(tmp_folder, save_path):
-    """
-    安全地合并多个JSON文件，避免格式错误
-    """
-    print(f"开始合并JSON文件从 {tmp_folder} 到 {save_path}")
-    
-    all_records = []
-    part_files = glob.glob(f"{tmp_folder}/*_part")
-    part_files.sort()  # 确保文件按顺序处理
-    
-    total_files = len(part_files)
-    valid_files = 0
-    total_records = 0
-    
-    for part_file in part_files:
-        try:
-            if os.path.getsize(part_file) > 0:  # 只处理非空文件
-                valid_files += 1
-                file_records = 0
-                with open(part_file, 'r', encoding='utf-8') as f:
-                    for line_num, line in enumerate(f, 1):
-                        line = line.strip()
-                        if line:
-                            try:
-                                # 验证JSON格式
-                                json.loads(line)
-                                all_records.append(line)
-                                file_records += 1
-                                total_records += 1
-                            except json.JSONDecodeError as e:
-                                print(f"警告: {part_file} 第{line_num}行JSON格式错误: {e}")
-                                print(f"问题行内容: {line[:100]}...")
-                                continue
-                print(f"文件 {part_file}: {file_records} 条有效记录")
-            else:
-                print(f"跳过空文件: {part_file}")
-        except Exception as e:
-            print(f"处理文件 {part_file} 时出错: {e}")
-            continue
-    
-    print(f"合并完成: {valid_files}/{total_files} 个文件有效，共 {total_records} 条记录")
-    
-    # 写入合并后的文件
-    try:
-        with open(save_path, 'w', encoding='utf-8') as f:
-            for record in all_records:
-                f.write(record + '\n')
-        print(f"成功写入 {save_path}，共 {len(all_records)} 条记录")
-        return len(all_records)
-    except Exception as e:
-        print(f"写入文件 {save_path} 时出错: {e}")
-        raise
-
-
 def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_path, multi_adapter_dir, target_hardware, original_target, device, allow_repeat, keep_cnt, is_build, worker_id, num_workers):
     try:
         # <<< 新增的TVM初始化代码 >>>
@@ -480,101 +425,67 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
         
         sketch_dic_list_full = list(sketch_dic.items())
         
-        # <<< 优化的数据分片逻辑 - 采用原始版本的均匀分片策略 >>>
-        # 使用数学计算确保数据均匀分布，避免步长分片可能导致的不均匀问题
-        per_len = math.ceil(len(sketch_dic_list_full) / num_workers)
-        start_idx = worker_id * per_len
-        end_idx = min((worker_id + 1) * per_len, len(sketch_dic_list_full))
-        my_sketch_chunk = sketch_dic_list_full[start_idx:end_idx]
-        
-        print(f"Worker {worker_id}: 数据分片 [{start_idx}:{end_idx}]，处理 {len(my_sketch_chunk)} out of {len(sketch_dic_list_full)} workload groups")
+        # <<< 关键的数据分片逻辑 >>>
+        my_sketch_chunk = sketch_dic_list_full[worker_id::num_workers]
+        print(f"Worker {worker_id}: Processing {len(my_sketch_chunk)} out of {len(sketch_dic_list_full)} workload groups")
         
         # 4. 主循环现在遍历自己的数据块
-        total_workloads = len(my_sketch_chunk)
-        successful_workloads = 0
-        total_generated = 0
-        
-        print(f"Worker {worker_id}: 开始处理 {total_workloads} 个workload组")
-        
-        for workload_idx, (workload_key, inputs) in enumerate(tqdm.tqdm(my_sketch_chunk, desc=f"Worker {worker_id}")):
-            try:
-                def gen_func_inner(task, states, max_new_tokens):
-                    max_new_tokens = max(max_new_tokens, 1)
-                    gen_kwargs["max_new_tokens"] = max_new_tokens
-                    return gen_func(task, states, inputs[0], tokenizer, model, device, gen_kwargs)
+        for workload_key, inputs in tqdm.tqdm(my_sketch_chunk):
+            
+            def gen_func_inner(task, states, max_new_tokens):
+                max_new_tokens = max(max_new_tokens, 1)
+                gen_kwargs["max_new_tokens"] = max_new_tokens
+                return gen_func(task, states, inputs[0], tokenizer, model, device, gen_kwargs)
 
-                policy = auto_scheduler.SketchPolicy(inputs[0].task)
-                measure_inputs = []
-                measure_results = []
-                input_set = set()
-                
-                # from filelock import FileLock
-                # lock = FileLock('/root/tlm/gen/my_lock.lock')
-                # with lock:
-                retry_i = 0
-                while retry_i < 5:
-                    try:
-                        all_state_list = policy.gen_states([inp.state for inp in inputs], gen_func_inner)
-                        # measure_inputs_cnt_before = len(measure_inputs)
+            policy = auto_scheduler.SketchPolicy(inputs[0].task)
+            measure_inputs = []
+            measure_results = []
+            input_set = set()
+            
+            # from filelock import FileLock
+            # lock = FileLock('/root/tlm/gen/my_lock.lock')
+            # with lock:
+            retry_i = 0
+            while retry_i < 5:
+                all_state_list = policy.gen_states([inp.state for inp in inputs], gen_func_inner)
+                # measure_inputs_cnt_before = len(measure_inputs)
 
-                        measure_inputs_tmp = []
-                        for state in all_state_list:
-                            inp = auto_scheduler.MeasureInput(inputs[0].task, state)
-                            i_str = inp.to_json()
-                            if i_str in input_set:
-                                continue
-                            if allow_repeat is False and check_measured(i_str):
-                                continue
-                            
-                            input_set.add(i_str)
-                            measure_inputs_tmp.append(inp)
-
-                        default_build_result = auto_scheduler.measure.BuildResult(None, [], 0, None, 0)
-                        if is_build:
-                            build_results = builder.build(measure_inputs_tmp)
-                        else:
-                            build_results = [default_build_result for x in measure_inputs_tmp]
-                        for res, inp in zip(build_results, measure_inputs_tmp):
-                            if res.error_no == 0:
-                                measure_inputs.append(inp)
-                                measure_results.append(auto_scheduler.MeasureResult([0.0], 0, "", 0, time.time()))
-
-                        retry_i += 1
-                        # measure_inputs_cnt_after = len(measure_inputs)
-                        # if measure_inputs_cnt_before == measure_inputs_cnt_after:
-                        #     retry_i += 1
-                        # else:
-                        #     retry_i = 0
-                        if len(measure_inputs) >= keep_cnt:
-                            break
-                    except Exception as e:
-                        print(f"Worker {worker_id}: workload {workload_key} 第{retry_i+1}次重试时出错: {e}")
-                        retry_i += 1
-                        if retry_i >= 5:
-                            print(f"Worker {worker_id}: workload {workload_key} 重试5次后仍然失败，跳过")
-                            break
+                measure_inputs_tmp = []
+                for state in all_state_list:
+                    inp = auto_scheduler.MeasureInput(inputs[0].task, state)
+                    i_str = inp.to_json()
+                    if i_str in input_set:
                         continue
-                
-                if len(measure_inputs) > keep_cnt:
-                    measure_inputs, measure_results = zip(
-                        *random.sample(list(zip(measure_inputs, measure_results)), keep_cnt)
-                    )
-                
-                if len(measure_inputs) > 0:
-                    auto_scheduler.save_records(save_path_i, measure_inputs, measure_results)
-                    successful_workloads += 1
-                    total_generated += len(measure_inputs)
-                    print(f"Worker {worker_id}: workload {workload_key} 成功生成 {len(measure_inputs)} 条记录")
-                else:
-                    print(f"Worker {worker_id}: workload {workload_key} 未能生成任何有效记录")
+                    if allow_repeat is False and check_measured(i_str):
+                        continue
                     
-            except Exception as e:
-                print(f"Worker {worker_id}: 处理workload {workload_key} 时发生严重错误: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-        
-        print(f"Worker {worker_id}: 处理完成！成功处理 {successful_workloads}/{total_workloads} 个workload，共生成 {total_generated} 条记录")
+                    input_set.add(i_str)
+                    measure_inputs_tmp.append(inp)
+
+                default_build_result = auto_scheduler.measure.BuildResult(None, [], 0, None, 0)
+                if is_build:
+                    build_results = builder.build(measure_inputs_tmp)
+                else:
+                    build_results = [default_build_result for x in measure_inputs_tmp]
+                for res, inp in zip(build_results, measure_inputs_tmp):
+                    if res.error_no == 0:
+                        measure_inputs.append(inp)
+                        measure_results.append(auto_scheduler.MeasureResult([0.0], 0, "", 0, time.time()))
+
+                retry_i += 1
+                # measure_inputs_cnt_after = len(measure_inputs)
+                # if measure_inputs_cnt_before == measure_inputs_cnt_after:
+                #     retry_i += 1
+                # else:
+                #     retry_i = 0
+                if len(measure_inputs) >= keep_cnt:
+                    break
+            
+            if len(measure_inputs) > keep_cnt:
+                measure_inputs, measure_results = zip(
+                    *random.sample(list(zip(measure_inputs, measure_results)), keep_cnt)
+                )
+            auto_scheduler.save_records(save_path_i, measure_inputs, measure_results)
     except Exception as e:
         err_queue.put(e)
 
@@ -612,20 +523,7 @@ def main():
     # 不再在主进程中处理inputs，改为传递文件路径给子进程
     # 子进程将重新读取文件并构建TVM对象
 
-    # 修复GPU设备检测，支持CUDA_VISIBLE_DEVICES环境变量
-    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '')
-    if visible_devices:
-        # 解析可见的GPU设备
-        visible_gpu_list = [int(x.strip()) for x in visible_devices.split(',') if x.strip()]
-        num_gpus = len(visible_gpu_list)
-        print(f"使用CUDA_VISIBLE_DEVICES={visible_devices}，检测到{num_gpus}个GPU")
-        print(f"可见GPU列表: {visible_gpu_list}")
-    else:
-        # 如果没有设置CUDA_VISIBLE_DEVICES，使用所有可用GPU
-        num_gpus = torch.cuda.device_count()
-        visible_gpu_list = list(range(num_gpus))
-        print(f"未设置CUDA_VISIBLE_DEVICES，使用所有{num_gpus}个GPU")
-    
+    num_gpus = torch.cuda.device_count()
     # filelist = []
     processes = []
     tmp_folder = '.gen_state'
@@ -636,15 +534,7 @@ def main():
     for gpu_i in range(num_gpus):
         save_path_i = f'{tmp_folder}/{gpu_i}_part'
         # filelist.append(save_path_i)
-        # 关键修复：当设置了CUDA_VISIBLE_DEVICES时，设备ID应该从0开始
-        # 因为CUDA_VISIBLE_DEVICES会重新映射设备ID
-        if visible_devices:
-            device = f'cuda:{gpu_i}'  # 使用重新映射后的ID
-            actual_physical_gpu = visible_gpu_list[gpu_i]
-            print(f"Worker {gpu_i}: 使用设备 {device} (物理GPU {actual_physical_gpu})")
-        else:
-            device = f'cuda:{gpu_i}'
-            print(f"Worker {gpu_i}: 使用设备 {device}")
+        device = f'cuda:{gpu_i}'
         p = Process(target=worker, args=(err_queue, save_path_i, script_args.sketch_path, gen_kwargs, script_args.model_path, script_args.adapter_path, script_args.multi_adapter_dir, script_args.target_hardware, script_args.target, device, script_args.allow_repeat, script_args.keep_cnt, script_args.is_build, gpu_i, num_gpus))
         p.start()
         processes.append(p)
@@ -655,17 +545,8 @@ def main():
         raise Exception(f"An exception occurred in the child process: {err_queue.get()}")
 
 
-    # 使用安全的JSON合并函数替代简单的cat命令
-    try:
-        total_records = merge_json_files_safely(tmp_folder, script_args.save_path)
-        print(f"推理完成！总共生成 {total_records} 条记录")
-    except Exception as e:
-        print(f"JSON合并失败: {e}")
-        # 如果合并失败，回退到原始方法
-        print("回退到原始cat命令...")
-        subprocess.run(f"cat {tmp_folder}/*_part > {script_args.save_path}", shell=True)
-    finally:
-        shutil.rmtree(tmp_folder)
+    subprocess.run(f"cat {tmp_folder}/*_part > {script_args.save_path}", shell=True)
+    shutil.rmtree(tmp_folder)
     
 
 

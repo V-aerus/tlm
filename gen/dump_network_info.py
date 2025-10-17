@@ -82,12 +82,20 @@ if __name__ == "__main__":
     if args.target.kind.name == "llvm":
         hardware_params = auto_scheduler.HardwareParams(target=args.target)
     elif args.target.kind.name == "cuda":
+        # 修复：使用get()方法提供默认值，避免KeyError
+        max_shared_memory = args.target.attrs.get("max_shared_memory_per_block", 49152)
+        max_threads = args.target.attrs.get("max_threads_per_block", 1024)
+        
+        print(f"CUDA Target attributes: {args.target.attrs}")
+        print(f"Using max_shared_memory_per_block: {max_shared_memory}")
+        print(f"Using max_threads_per_block: {max_threads}")
+        
         hardware_params = auto_scheduler.HardwareParams(
             num_cores=-1,
             vector_unit_bytes=16,
             cache_line_bytes=64,
-            max_shared_memory_per_block=int(args.target.attrs["max_shared_memory_per_block"]),
-            max_threads_per_block=int(args.target.attrs["max_threads_per_block"]),
+            max_shared_memory_per_block=int(max_shared_memory),
+            max_threads_per_block=int(max_threads),
             # The value `max_local_memory_per_block` is not used in AutoScheduler,
             # but is required by the API.
             max_local_memory_per_block=12345678,
