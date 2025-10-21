@@ -162,16 +162,20 @@ def load_model_for_inference(args: ScriptArguments) -> tuple:
         with open(adapter_config_path, 'r') as f:
             adapter_config = json.load(f)
         
-        # 创建ModelArguments对象
+        # 创建ModelArguments对象（兼容无HA配置与关闭mixer）
+        ha_cfg = adapter_config.get('ha_config', None)
+        hs_cfg = adapter_config.get('hs_config', {}) or {}
+        use_ha = isinstance(ha_cfg, dict) and (ha_cfg.get('r', 0) or 0) > 0
         model_args = ModelArguments(
             use_mt_moslora=True,
-            use_mixer=adapter_config.get('ha_config', {}).get('use_mixer', True),
-            ha_lora_r=adapter_config.get('ha_config', {}).get('r', 16),
-            ha_lora_alpha=adapter_config.get('ha_config', {}).get('alpha', 16),
-            ha_lora_dropout=adapter_config.get('ha_config', {}).get('dropout', 0.05),
-            hs_lora_r=adapter_config.get('hs_config', {}).get('r', 16),
-            hs_lora_alpha=adapter_config.get('hs_config', {}).get('alpha', 32),
-            hs_lora_dropout=adapter_config.get('hs_config', {}).get('dropout', 0.05),
+            use_mixer=(hs_cfg.get('use_mixer', False) if not use_ha else ha_cfg.get('use_mixer', False)),
+            use_ha=use_ha,
+            ha_lora_r=(ha_cfg.get('r', 0) if isinstance(ha_cfg, dict) else 0),
+            ha_lora_alpha=(ha_cfg.get('alpha', 0) if isinstance(ha_cfg, dict) else 0),
+            ha_lora_dropout=(ha_cfg.get('dropout', 0.0) if isinstance(ha_cfg, dict) else 0.0),
+            hs_lora_r=hs_cfg.get('r', 16),
+            hs_lora_alpha=hs_cfg.get('alpha', 32),
+            hs_lora_dropout=hs_cfg.get('dropout', 0.05),
             hardware_types=','.join(adapter_config.get('hardware_types', [])),
             target_modules=','.join(adapter_config.get('target_modules', [])) if adapter_config.get('target_modules') else None
         )
@@ -189,14 +193,16 @@ def load_model_for_inference(args: ScriptArguments) -> tuple:
         print(f"Target hardware: {target_hardware}")
         
         # 加载 HA 适配器
-        print("Loading HA adapter...")
-        ha_adapter_path = os.path.join(args.multi_adapter_dir, "ha_adapter.bin")
-        if os.path.exists(ha_adapter_path):
-            ha_adapters = torch.load(ha_adapter_path, map_location='cpu')
-            print(f"Loaded HA adapter with {len(ha_adapters)} modules")
-        else:
-            print(f"Warning: HA adapter not found at {ha_adapter_path}")
-            ha_adapters = {}
+        # 可选加载 HA 适配器
+        ha_adapters = {}
+        if model_args.use_ha:
+            print("Loading HA adapter...")
+            ha_adapter_path = os.path.join(args.multi_adapter_dir, "ha_adapter.bin")
+            if os.path.exists(ha_adapter_path):
+                ha_adapters = torch.load(ha_adapter_path, map_location='cpu')
+                print(f"Loaded HA adapter with {len(ha_adapters)} modules")
+            else:
+                print(f"Warning: HA adapter not found at {ha_adapter_path}")
         
         # 加载 HS 适配器 (动态选择)
         print(f"Loading HS adapter for {target_hardware}...")
@@ -212,8 +218,8 @@ def load_model_for_inference(args: ScriptArguments) -> tuple:
         print("Applying adapter weights to model...")
         for name, module in model.named_modules():
             if isinstance(module, MTMoSLoRALinear):
-                # 加载HA适配器
-                if name in ha_adapters:
+                # 加载HA适配器（如启用）
+                if model_args.use_ha and name in ha_adapters:
                     ha_data = ha_adapters[name]
                     if ha_data['lora_A'] is not None:
                         module.ha_moslora.lora_A.load_state_dict(ha_data['lora_A'])

@@ -299,19 +299,23 @@ def main():
     with open(model_args.adapter_config_path, 'r') as f:
         adapter_config = json.load(f)
     
-    # 创建ModelArguments对象用于模型转换
+    # 创建ModelArguments对象用于模型转换（兼容无HA与关闭mixer）
+    ha_cfg = adapter_config.get('ha_config', None)
+    hs_cfg = adapter_config.get('hs_config', {}) or {}
+    use_ha = isinstance(ha_cfg, dict) and (ha_cfg.get('r', 0) or 0) > 0
     mt_model_args = ModelArguments(
         use_mt_moslora=True,
-        use_mixer=adapter_config['ha_config']['use_mixer'],
-        ha_lora_r=adapter_config['ha_config']['r'],
-        ha_lora_alpha=adapter_config['ha_config']['alpha'],
-        ha_lora_dropout=adapter_config['ha_config']['dropout'],
-        hs_lora_r=adapter_config['hs_config']['r'],
-        hs_lora_alpha=adapter_config['hs_config']['alpha'],
-        hs_lora_dropout=adapter_config['hs_config']['dropout'],
-        hardware_types=','.join(adapter_config['hardware_types']),
-        target_modules=','.join(adapter_config['target_modules']),
-        defuse_gpt2_attn=True  # 添加GPT-2解融合
+        use_mixer=(hs_cfg.get('use_mixer', False) if not use_ha else ha_cfg.get('use_mixer', False)),
+        use_ha=use_ha,
+        ha_lora_r=(ha_cfg.get('r', 0) if isinstance(ha_cfg, dict) else 0),
+        ha_lora_alpha=(ha_cfg.get('alpha', 0) if isinstance(ha_cfg, dict) else 0),
+        ha_lora_dropout=(ha_cfg.get('dropout', 0.0) if isinstance(ha_cfg, dict) else 0.0),
+        hs_lora_r=hs_cfg.get('r', 16),
+        hs_lora_alpha=hs_cfg.get('alpha', 32),
+        hs_lora_dropout=hs_cfg.get('dropout', 0.05),
+        hardware_types=','.join(adapter_config.get('hardware_types', [])),
+        target_modules=','.join(adapter_config.get('target_modules', [])) if adapter_config.get('target_modules') else None,
+        defuse_gpt2_attn=True
     )
     
     # 先进行GPT-2解融合（如果需要）
@@ -480,16 +484,20 @@ def main():
         logger.info("Saving updated MT-MoSLoRA adapters...")
         from train_mt_moslora import save_mt_moslora_adapters, ModelArguments
         
-        # 创建ModelArguments对象用于保存
+        # 创建ModelArguments对象用于保存（保持与上游一致）
+        ha_cfg = adapter_config.get('ha_config', None)
+        hs_cfg = adapter_config.get('hs_config', {}) or {}
+        use_ha = isinstance(ha_cfg, dict) and (ha_cfg.get('r', 0) or 0) > 0
         save_model_args = ModelArguments(
             use_mt_moslora=True,
-            use_mixer=adapter_config.get('ha_config', {}).get('use_mixer', True),
-            ha_lora_r=adapter_config.get('ha_config', {}).get('r', 16),
-            ha_lora_alpha=adapter_config.get('ha_config', {}).get('alpha', 16),
-            ha_lora_dropout=adapter_config.get('ha_config', {}).get('dropout', 0.05),
-            hs_lora_r=adapter_config.get('hs_config', {}).get('r', 16),
-            hs_lora_alpha=adapter_config.get('hs_config', {}).get('alpha', 32),
-            hs_lora_dropout=adapter_config.get('hs_config', {}).get('dropout', 0.05),
+            use_mixer=(hs_cfg.get('use_mixer', False) if not use_ha else ha_cfg.get('use_mixer', False)),
+            use_ha=use_ha,
+            ha_lora_r=(ha_cfg.get('r', 0) if isinstance(ha_cfg, dict) else 0),
+            ha_lora_alpha=(ha_cfg.get('alpha', 0) if isinstance(ha_cfg, dict) else 0),
+            ha_lora_dropout=(ha_cfg.get('dropout', 0.0) if isinstance(ha_cfg, dict) else 0.0),
+            hs_lora_r=hs_cfg.get('r', 16),
+            hs_lora_alpha=hs_cfg.get('alpha', 32),
+            hs_lora_dropout=hs_cfg.get('dropout', 0.05),
             hardware_types=','.join(adapter_config.get('hardware_types', [])),
             target_modules=','.join(adapter_config.get('target_modules', [])) if adapter_config.get('target_modules') else None
         )

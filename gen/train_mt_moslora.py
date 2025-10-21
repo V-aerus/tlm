@@ -152,7 +152,9 @@ class ModelArguments:
 
     # --- MT-MoSLoRA arguments ---
     use_mt_moslora: bool = field(default=False, metadata={"help": "Enable MT-MoSLoRA (HA + HS dual-track)"})
-    use_mixer: bool = field(default=True, metadata={"help": "Enable MoSLoRA mixer (W matrix)"})
+    use_mixer: bool = field(default=False, metadata={"help": "Enable MoSLoRA mixer (W matrix). If False, behave like standard LoRA"})
+    # 是否启用HA（硬件无关）路径：为迁移到“仅专家/去HA”架构，默认关闭
+    use_ha: bool = field(default=False, metadata={"help": "Enable HA (hardware-agnostic) adapter path. Default False to remove HA path"})
     
     # HA (Hardware-Agnostic) parameters
     ha_lora_r: Optional[int] = field(default=16, metadata={"help": "HA LoRA rank r"})
@@ -280,20 +282,24 @@ class MTMoSLoRALinear(nn.Module):
     - Forward: base_output + ha_delta + hs_delta
     """
     
-    def __init__(self, in_features: int, out_features: int, 
-                 ha_config: dict, hs_config: dict, hardware_types: List[str]):
+    def __init__(self, in_features: int, out_features: int,
+                 hs_config: dict, hardware_types: List[str], use_ha: bool = False, ha_config: dict = None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.hardware_types = hardware_types
+        self.use_ha = bool(use_ha)
         
         # Base linear layer (frozen)
         self.base_linear = nn.Linear(in_features, out_features, bias=True)
         self.base_linear.weight.requires_grad = False
         self.base_linear.bias.requires_grad = False
         
-        # HA (Hardware-Agnostic) MoSLoRA module
-        self.ha_moslora = self._create_moslora_module(in_features, out_features, ha_config, is_ha=True)
+        # HA (Hardware-Agnostic) MoSLoRA module（可选，默认关闭以移除HA路径）
+        if self.use_ha and ha_config is not None and ha_config.get('r', 0) and ha_config.get('r', 0) > 0:
+            self.ha_moslora = self._create_moslora_module(in_features, out_features, ha_config, is_ha=True)
+        else:
+            self.ha_moslora = None
         
         # HS (Hardware-Specific) MoSLoRA modules
         self.hs_experts = nn.ModuleDict()
@@ -314,7 +320,7 @@ class MTMoSLoRALinear(nn.Module):
             r=config['r'],
             lora_alpha=config['alpha'],
             lora_dropout=config['dropout'],
-            lora_use_mixer=config.get('use_mixer', True),
+            lora_use_mixer=config.get('use_mixer', False),
             bias=True
         )
         
@@ -373,8 +379,11 @@ class MTMoSLoRALinear(nn.Module):
         # Base model output (frozen)
         base_output = self.base_linear(x)
         
-        # HA (Hardware-Agnostic) adaptation - always applied
-        ha_delta = self.ha_moslora(x)
+        # HA (Hardware-Agnostic) adaptation - 可选（默认无）
+        if self.ha_moslora is not None:
+            ha_delta = self.ha_moslora(x)
+        else:
+            ha_delta = torch.zeros_like(base_output)
         
         # HS (Hardware-Specific) adaptation - only for specific hardware
         hs_delta = torch.zeros_like(base_output)
@@ -389,14 +398,14 @@ class MTMoSLoRALinear(nn.Module):
             if hw_type in self.hs_experts:
                 hs_delta = self.hs_experts[hw_type](x)
         
-        # Final output: base + HA + HS
+        # Final output: base + [HA] + HS（当HA禁用时，ha_delta为0）
         final_output = base_output + ha_delta + hs_delta
         
         return final_output
     
     def get_trainable_parameters(self):
         """Get statistics about trainable parameters"""
-        ha_params = sum(p.numel() for p in self.ha_moslora.parameters() if p.requires_grad)
+        ha_params = sum(p.numel() for p in self.ha_moslora.parameters() if p.requires_grad) if self.ha_moslora is not None else 0
         hs_params = sum(p.numel() for p in self.hs_experts.parameters() if p.requires_grad)
         total_params = ha_params + hs_params
         
@@ -435,19 +444,20 @@ def save_mt_moslora_adapters(model: nn.Module, output_dir: str, model_args: Mode
             logger.info(f"Module: {name}, Type: {type(module)}")
         return
     
-    # 保存HA适配器
-    ha_adapters = {}
-    for name, module in mt_moslora_modules.items():
-        ha_adapters[name] = {
-            'lora_A': module.ha_moslora.lora_A.state_dict() if hasattr(module.ha_moslora, 'lora_A') else None,
-            'lora_B': module.ha_moslora.lora_B.state_dict() if hasattr(module.ha_moslora, 'lora_B') else None,
-            'lora_AB': module.ha_moslora.lora_AB.state_dict() if hasattr(module.ha_moslora, 'lora_AB') else None,
-        }
-    
-    # 保存HA适配器
-    ha_adapter_path = os.path.join(output_dir, "ha_adapter.bin")
-    torch.save(ha_adapters, ha_adapter_path)
-    logger.info(f"HA adapter saved to {ha_adapter_path}")
+    # 保存HA适配器（仅当启用HA且存在对应模块时）
+    if model_args.use_ha:
+        ha_adapters = {}
+        for name, module in mt_moslora_modules.items():
+            if module.ha_moslora is not None:
+                ha_adapters[name] = {
+                    'lora_A': module.ha_moslora.lora_A.state_dict() if hasattr(module.ha_moslora, 'lora_A') else None,
+                    'lora_B': module.ha_moslora.lora_B.state_dict() if hasattr(module.ha_moslora, 'lora_B') else None,
+                    'lora_AB': module.ha_moslora.lora_AB.state_dict() if hasattr(module.ha_moslora, 'lora_AB') else None,
+                }
+        if len(ha_adapters) > 0:
+            ha_adapter_path = os.path.join(output_dir, "ha_adapter.bin")
+            torch.save(ha_adapters, ha_adapter_path)
+            logger.info(f"HA adapter saved to {ha_adapter_path}")
     
     # 保存HS适配器
     hardware_types = [t.strip() for t in model_args.hardware_types.split(",")]
@@ -467,8 +477,8 @@ def save_mt_moslora_adapters(model: nn.Module, output_dir: str, model_args: Mode
     
     # 保存适配器配置
     adapter_config = {
-        "adapter_type": "MT-MoSLoRA",
-        "ha_config": {
+        "adapter_type": "MT-MoSLoSLoRA_no_HA" if not model_args.use_ha else "MT-MoSLoSLoRA",
+        "ha_config": None if not model_args.use_ha else {
             "r": model_args.ha_lora_r,
             "alpha": model_args.ha_lora_alpha,
             "dropout": model_args.ha_lora_dropout,
@@ -507,14 +517,6 @@ def apply_mt_moslora_to_model(model: nn.Module, model_args: ModelArguments) -> n
         # Default target modules for GPT-2 after defusion
         target_modules = ["q_proj", "k_proj", "v_proj", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"]
     
-    # HA and HS configurations
-    ha_config = {
-        'r': model_args.ha_lora_r,
-        'alpha': model_args.ha_lora_alpha,
-        'dropout': model_args.ha_lora_dropout,
-        'use_mixer': model_args.use_mixer
-    }
-    
     hs_config = {
         'r': model_args.hs_lora_r,
         'alpha': model_args.hs_lora_alpha,
@@ -534,9 +536,15 @@ def apply_mt_moslora_to_model(model: nn.Module, model_args: ModelArguments) -> n
                 new_module = MTMoSLoRALinear(
                     in_features=module.in_features,
                     out_features=module.out_features,
-                    ha_config=ha_config,
                     hs_config=hs_config,
-                    hardware_types=hardware_types
+                    hardware_types=hardware_types,
+                    use_ha=model_args.use_ha,
+                    ha_config={
+                        'r': model_args.ha_lora_r,
+                        'alpha': model_args.ha_lora_alpha,
+                        'dropout': model_args.ha_lora_dropout,
+                        'use_mixer': model_args.use_mixer
+                    } if model_args.use_ha else None
                 )
                 
                 # Copy weights from original module
