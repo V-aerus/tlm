@@ -28,9 +28,9 @@ def register_data_path(target_str):
 
     print(f'register data path: {model}')
     global NETWORK_INFO_FOLDER, TO_MEASURE_PROGRAM_FOLDER, MEASURE_RECORD_FOLDER, HARDWARE_PLATFORM
-    NETWORK_INFO_FOLDER = f"/home/hangshuaihe/tlm/tlm_dataset/gen/dataset/network_info/{model}"
-    TO_MEASURE_PROGRAM_FOLDER = f"/home/hangshuaihe/tlm/tlm_dataset/gen/dataset/to_measure_programs/{model}"
-    MEASURE_RECORD_FOLDER = f"/home/hangshuaihe/tlm/tlm_dataset/gen/dataset/measure_records/{model}"
+    NETWORK_INFO_FOLDER = f"/home/hehangshuai/workspace/tlm/tlm_dataset/gen/dataset/network_info/{model}"
+    TO_MEASURE_PROGRAM_FOLDER = f"/home/hehangshuai/workspace/tlm/tlm_dataset/gen/dataset/to_measure_programs/{model}"
+    MEASURE_RECORD_FOLDER = f"/home/hehangshuai/workspace/tlm/tlm_dataset/gen/dataset/measure_records/{model}"
     HARDWARE_PLATFORM = model
 
 

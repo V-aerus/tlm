@@ -214,9 +214,10 @@ def load_model_for_inference(args: ScriptArguments) -> tuple:
             print(f"Warning: HS {target_hardware} adapter not found at {hs_adapter_path}")
             hs_adapters = {}
         
-        # 应用适配器权重到模型
+        # 应用适配器权重到模型（兼容 FrozenBaseWrapper）
         print("Applying adapter weights to model...")
-        for name, module in model.named_modules():
+        target_model = getattr(model, "base_model", model)
+        for name, module in target_model.named_modules():
             if isinstance(module, MTMoSLoRALinear):
                 # 加载HA适配器（如启用）
                 if model_args.use_ha and name in ha_adapters:
@@ -340,8 +341,9 @@ def load_mt_moslora_adapters(model, multi_adapter_dir, target_hardware):
         print(f"Warning: HS {target_hardware} adapter not found at {hs_adapter_path}")
         hs_adapters = {}
     
-    # 应用适配器权重到模型
-    for name, module in model.named_modules():
+    # 应用适配器权重到模型（兼容 FrozenBaseWrapper）
+    target_model = getattr(model, "base_model", model)
+    for name, module in target_model.named_modules():
         if isinstance(module, MTMoSLoRALinear):
             # 加载HA适配器
             if name in ha_adapters:
@@ -368,7 +370,9 @@ def set_target_hardware(model, target_hardware):
     """
     设置目标硬件，激活对应的HS适配器
     """
-    for name, module in model.named_modules():
+    # 兼容 FrozenBaseWrapper
+    target_model = getattr(model, "base_model", model)
+    for name, module in target_model.named_modules():
         if isinstance(module, MTMoSLoRALinear):
             module.set_active_hardware(target_hardware)
 

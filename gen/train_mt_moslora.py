@@ -57,6 +57,12 @@ _LOCAL_PEFT_PATH = os.path.join(_BASE_DIR, "MosLora", "peft", "src")
 if os.path.isdir(_LOCAL_PEFT_PATH) and _LOCAL_PEFT_PATH not in sys.path:
     sys.path.append(_LOCAL_PEFT_PATH)
 
+# Add top-level modeling package to path (if needed)
+_PROJECT_ROOT = os.path.dirname(_BASE_DIR)
+_TOP_MODELING_PATH = os.path.join(_PROJECT_ROOT, "modeling")
+if os.path.isdir(_TOP_MODELING_PATH) and _TOP_MODELING_PATH not in sys.path:
+    sys.path.append(_TOP_MODELING_PATH)
+
 try:
     from peft import LoraConfig, get_peft_model
     from peft.tuners.lora import Linear as MoSLoRALinear
@@ -64,6 +70,12 @@ except Exception:
     LoraConfig = None
     get_peft_model = None
     MoSLoRALinear = None
+
+try:
+    # prefer top-level modeling
+    from modeling import FrozenBaseWrapper
+except Exception:
+    FrozenBaseWrapper = None
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.29.0.dev0")
@@ -428,9 +440,10 @@ def save_mt_moslora_adapters(model: nn.Module, output_dir: str, model_args: Mode
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
     
-    # 收集所有MT-MoSLoRA模块
+    # 兼容 FrozenBaseWrapper：对 target_model 遍历
+    target_model = getattr(model, "base_model", model)
     mt_moslora_modules = {}
-    for name, module in model.named_modules():
+    for name, module in target_model.named_modules():
         if isinstance(module, MTMoSLoRALinear):
             mt_moslora_modules[name] = module
     
@@ -438,7 +451,7 @@ def save_mt_moslora_adapters(model: nn.Module, output_dir: str, model_args: Mode
     if len(mt_moslora_modules) == 0:
         logger.error("No MT-MoSLoRA modules found! This indicates a serious problem.")
         # 打印所有模块名称用于调试
-        all_modules = list(model.named_modules())
+        all_modules = list(target_model.named_modules())
         logger.info(f"Total modules in model: {len(all_modules)}")
         for name, module in all_modules[:10]:  # 只显示前10个
             logger.info(f"Module: {name}, Type: {type(module)}")
@@ -524,9 +537,10 @@ def apply_mt_moslora_to_model(model: nn.Module, model_args: ModelArguments) -> n
         'use_mixer': model_args.use_mixer
     }
     
-    # Find and replace target modules
+    # Find and replace target modules (compatible with FrozenBaseWrapper)
+    target_model = getattr(model, "base_model", model)
     replacements = {}
-    for name, module in model.named_modules():
+    for name, module in target_model.named_modules():
         if any(name.endswith("." + target) for target in target_modules):
             if isinstance(module, nn.Linear):
                 parent_name = ".".join(name.split('.')[:-1])
@@ -559,7 +573,7 @@ def apply_mt_moslora_to_model(model: nn.Module, model_args: ModelArguments) -> n
     
     # Apply replacements
     for parent_name, child_map in replacements.items():
-        parent_module = model.get_submodule(parent_name)
+        parent_module = target_model.get_submodule(parent_name)
         for child_name, new_module in child_map.items():
             setattr(parent_module, child_name, new_module)
             logger.info(f"Replaced {parent_name}.{child_name} with MT-MoSLoRA")
@@ -863,6 +877,9 @@ def main():
     # 应用MT-MoSLoRA
     if model_args.use_mt_moslora:
         logger.info("Applying MT-MoSLoRA...")
+        # Wrap base model as frozen base (non-intrusive; traversal must use target_model getattr)
+        if FrozenBaseWrapper is not None and not isinstance(model, FrozenBaseWrapper):
+            model = FrozenBaseWrapper(model)
         model = apply_mt_moslora_to_model(model, model_args)
         
         # 验证MT-MoSLoRA模块是否正确创建

@@ -41,38 +41,485 @@ FlexOlmo的“双路MoE”训练 和“负偏置”b_i 启发了您的门控设�
 总结：您的新架构（Frozen TLM-BASE + Gated LoRA Experts）可以被视为FlexOlmo思想在“低秩适应（LoRA）”领域的一次精彩应用。您通过引入“稳定锚点”解决了HA-LoRA的不稳定性，通过引入“单行路由”和“门控机制”实现了与FlexOlmo同等的数据灵活性和可扩展性。
 
 新思路：
-原 MT_MoSLoRA_README.md 架构（已废弃）：设计思想：一个“内置”的双轨系统 (HA-MoSLoRA + HS-MoSLoRA)。HA-MoSLoRA：一个所有数据都能训练的、硬件无关的共享LoRA。HS-MoSLoRA：一个并行的、根据硬件ID切换的、硬件专属的LoRA模块字典。缺点：您提到HA-LoRA不稳定，且整个系统是“一体式”的，不易扩展。新架构（本文档所描述的）：设计思想：一个“基座 + 可插拔专家库”的系统 (Base + Pluggable Experts)。TLM-BASE (基座)：这就是新的“硬件无关”部分。它被完全冻结，充当所有专家学习的“锚点”和“通用路径”。LoRA Expert (专家)：每个专家模块（{LoRA_i, r_i, b_i}）都是硬件专属的，并且是独立训练、即插即用的。路由机制：通过学习到的路由向量r_i和b_i，系统以“门控”方式（Gating）决定每个专家在多大程度上“修正”基座的输出。优点：彻底解耦。BASE保持稳定，任何人都可以独立贡献新的专家，系统具有无限的可扩展性和灵活性。第二部分：详细技术规格与编程实现指南（这份文档将指导您的AI助手完成编码）技术文档：模块化TLM-LoRA专家系统 (v2)1. 核心设计原则与架构本系统采用“基座 + 可插拔门控专家”架构，取代了原有的HA/HS双轨制。基座 (Base): TLM-BASE 模型，在所有训练和推理中完全冻结。它提供通用的上下文编码和“兜底”的预测路径。专家单元 (Expert Unit): 每个专家都是一个独立的模块，由三个核心组件构成：LoRA_i: LoRA参数（矩阵A和B），负责对TLM-BASE的输出进行低秩修正（Δy_i）。r_i (路由向量): 一个可训练的向量（nn.Parameter），维度与TLM-BASE的编码输出x相同。它是该专家的“语义指纹”。b_i (专家偏置): 一个可训练的标量（nn.Parameter），初始化为负数（如-1.0），并约束其≤0。它代表激活该专家的“固有成本”或“门槛”，是实现稀疏性的关键。训练范式 (独立训练): 严格遵守FLEXOLMO思想 1111。每个专家都在其私有数据上独立训练。训练时，系统只包含冻结的BASE和当前这一个LoRA专家。路由形式 (门控加法): 我们采用“隐式base=0”的对比策略，这在数学上等价于BASE vs LoRA的二路Softmax。单专家训练 (Training):$$y(x) = y_{\text{base}}(x) + g_i(x) \cdot \Delta y_i(x)$$其中，门控g_i(x)由Sigmoid函数实现：$$g_i(x) = \sigma\left(\frac{r_i^\top x + b_i}{\tau}\right)$$y_base是BASE的输出（被.detach()）。Δy_i是LoRA的修正量。g_i(x)是一个[0, 1]之间的标量，决定了修正量的“注入强度”。多专家推理 (Inference):$$y(x) = y_{\text{base}}(x) + \sum_{i \in \text{TopK}} w_i \cdot \Delta y_i(x)$$其中，权重w_i由Softmax在所有候选专家和“0分兜底路径”上计算得出：$$s_i = (r_i^\top x + b_i)$$$$\mathbf{w} = \text{softmax}\left(\frac{[0, s_1, s_2, \dots, s_k]}{\tau}\right)$$这个0就是隐式的BASE路径得分，确保sum(w_i)之和小于1，剩余的权重w_0“分配”给了y_base。2. 输入表示与标准化 (Input Representation)任务: 编码器（TLM-BASE的一部分）需要将一个复杂的任务（子图、形状、硬件特征）转换成一个单一的、高维的上下文向量x。x的来源: x应是TLM-BASE编码器在决定路由之前的最后一层隐藏状态。[关键] 标准化: 路由得分s_i = r_i^\top x + b_i对x的尺度非常敏感。必须在计算得分之前对x进行LayerNorm或nn.functional.normalize，以确保x的范数稳定。Python# x = self.base_encoder(task)
-# x_norm = self.routing_layernorm(x) 
-# s_i = (x_norm @ r_i) + b_i 
-3. 路由、偏置与温度 (Routing, Bias, Temperature)b_i (专家偏置): 必须强制其≤0。这可以通过torch.clamp(self.bias, max=0.0)在forward中实现，或者通过在优化器步骤后手动将其拉回（self.bias.data.clamp_(max=0.0)），或者通过L_bias损失项（见4.2）来实现。它确保LoRA默认是“关闭”的，只有当r_i^\top x的匹配度足够高以克服这个负偏置时，门才会被有意义地打开。τ (温度): 这是一个关键的校准超参数，用于控制Sigmoid/Softmax的“陡峭度”。作用: 它将原始得分s缩放，使其落入Sigmoid的“有效梯度区”。设定: 不要“拍脑袋”设定。一个科学的起点是将τ设置为路由得分s在验证集上的标准差(StdDev)。例如，如果s的StdDev约为3.5，就设置τ=3.5。这等价于对s进行标准化，使其落在[-1, 1]附近，此时Sigmoid的梯度最好。策略 (可选): 可以使用“温度退火”，即训练早期τ较大（平滑，鼓励探索），后期τ减小（尖锐，强化决策）。4. 训练回合 (Single Expert Training)这是系统的核心。每次训练只涉及一个专家。4.1 前向传播 (Forward Pass)AI助手需要实现一个GatedLoRAExpert模块，其forward方法必须返回计算损失所需的所有中间变量。
+> 本版替换旧版“HA+HS 双轨”实现指南；旧版可参考历史文件。
 
-4.2 复合损失函数 (The Compound Loss Function)这是防止门控 $g(x)$ 塌缩到1的关键。我们必须同时优化多个目标。总损失函数 $\mathcal{L}$ 应被设计为以下几项的加权和：$$\mathcal{L} = 
-\underbrace{\mathcal{L}_{\text{task}}}_{\text{主任务}} +
-\lambda_a \underbrace{\mathcal{L}_{\text{gate\_align}}}_{\text{门控-收益对齐}} +
-\lambda_s \underbrace{\mathcal{L}_{\text{sparse}}}_{\text{稀疏/开门成本}} +
-\lambda_b \underbrace{\mathcal{L}_{\text{bias}}}_{\text{偏置约束}} +
-\lambda_\Delta \underbrace{\mathcal{L}_{\text{delta}}}_{\text{无谓改动惩罚}} +
-\lambda_{KD} \underbrace{\mathcal{L}_{\text{consistency}}}_{\text{一致性/蒸馏}}$$$\mathcal{L}_{\text{task}}$ (主任务损失):目标: 优化最终输出 $y_{\text{final}}$ 的性能。这是最主要的驱动力。实现: 根据您的闭环，这可以是监督微调（SFT）损失，例如 nn.CrossEntropyLoss(y_final, sft_target)；也可以是基于延迟/奖励的损失。$\mathcal{L}_{\text{gate\_align}}$ (门控-收益对齐损失) [关键]:目标: 强迫门 $g_i(x)$ 去预测LoRA的“真实收益” $y^*(x)$。这是防止 $g(x)$ 盲目变为1的核心机制。$y^*(x)$的计算 (软标签):从缓存/代理模型（见第5节）中获取 $lat_{\text{base}}$。实时测量 $lat_{\text{lora}}$（这在计算 $\mathcal{L}_{\text{task}}$ 时可以顺带得到）。$y^*(x) = \text{torch.sigmoid}((lat_{\text{base}} - lat_{\text{lora}}) / \beta)$。$\beta$ 是一个温度参数，用于平滑收益值。实现: nn.BCELoss(g_i, y_star.detach()) 或 nn.MSELoss(g_i, y_star.detach())。$\mathcal{L}_{\text{sparse}}$ (稀疏/开门成本损失):目标: 为“开门”这个行为本身施加一个小的“税”，防止无谓的开启。实现: $g_i\text{.mean()}$ 或 $\mathbb{E}[g_i]$。这个值被加到总损失中，优化器会自动倾向于在不需要时将 $g_i$ 压向0。$\mathcal{L}_{\text{bias}}$ (偏置约束损失):目标: 确保专家偏置 $b_i$ 保持在 $b_i \le 0$。实现: torch.clamp(self.b_i, min=0.0).pow(2)。只惩罚“正偏置”，允许其自由变为负数。$\mathcal{L}_{\text{delta}}$ (无谓改动惩罚):目标: 惩罚LoRA增量 $\Delta y_i$ 本身的大小。如果LoRA只是做出了微小的改动但没有带来收益，此项会轻微地惩罚它。实现: delta_y_i.pow(2).mean() 或 $\|\Delta y_i\|^2$。$\mathcal{L}_{\text{consistency}}$ (一致性/蒸馏损失):目标: 惩罚 $y_{\text{final}}$ 与 $y_{\text{base}}$ 之间的差异。这是最强的“刹车”：如果LoRA的改动没有带来显著的 $\mathcal{L}_{\text{task}}$ 提升，此损失项会起主导作用，将 $y_{\text{final}}$ 强行拉回 $y_{\text{base}}$，从而迫使 $g_i$ 关闭。实现: nn.MSELoss(y_final, y_base.detach())。[AI助手指南]：训练循环中，loss.backward() 会计算所有这些项的梯度，并同时更新 lora.parameters()、r_i 和 b_i。5. 成本控制：$\mathcal{L}_{\text{gate_align}}$的低成本实现$\mathcal{L}_{\text{gate\_align}}$ 需要 $lat_{\text{base}}$，但我们不能每次都测量。BaseLatencyCache (缓存) [首选方案]:实现: 一个持久化的KV存储（如Redis、shelve或简单的Python字典）。Key: hash(subgraph_str) + hardware_id + shape_str。一个能唯一标识任务的字符串。Value: $lat_{\text{base}}$ (浮点数)。流程: 训练时，首先查询缓存。命中 (Hit): 直接使用缓存的值。未命中 (Miss): (关键) 此时进行一次昂贵的“双重测量”。测量base-only的延迟，存入缓存，然后再测量base+LoRA的延迟用于 $\mathcal{L}_{\text{task}}$。校准 (Optional): 按一定概率（如5%）或时间间隔（如每1000步），强制重新测量并更新缓存，以防漂移。Surrogate Model (代理模型) [备选方案]:实现: 一个轻量的MLP或GNN，MLP(hardware_embed, graph_features) -> $\widehat{lat}_{\text{base}}$ (预测的base延迟)。流程: 当缓存未命中时，不进行双重测量，而是用代理模型预测 $\widehat{lat}_{\text{base}}$。这个预测值用于计算 $y^*(x)$。纠偏: 使用“抽样校准”得到的真实 $lat_{\text{base}}$ 数据（来自BaseLatencyCache的Miss事件），定期对这个MLP进行微调。[AI助手指南]：优先实现BaseLatencyCache。这是最高效、最稳妥的方案。6. 推理与部署 (Inference & Deployment)步骤1：簇级粗路由 (L1 Filter - Optional):当专家库非常大时（>1000个），用于快速筛选。输入：hardware_embedding。逻辑：与预先计算好的“簇中心向量”计算相似度，选出Top-M个簇。步骤2：细粒度路由 (L2 Route):输入：x_norm（来自BASE编码器）。逻辑：从L1选中的簇中（或从全部专家中）获取候选的 $\{r_i, b_i\}$。计算所有候选的得分 $s_i = (x_{\text{norm}} @ r_i) + b_i$。[关键] 在得分列表前插入一个0：scores = [0, s_1, s_2, ..., s_k]。计算权重：$\mathbf{w} = \text{softmax}(\text{scores} / \tau)$。选出Top-K个得分最高的LoRA索引（即 $\mathbf{w}$ 中除了第0个元素外的Top-K）。步骤3：门控加权 (Gated Sum):获取Top-K个LoRA的权重 $w_i$ 和修正量 $\Delta y_i$。$y_{\text{final}} = y_{\text{base}} + \sum_{i \in \text{TopK}} (w_i \cdot \Delta y_i)$。离线合成 (Offline Synthesis) (Optional):针对特定高频任务（例如某个特定硬件上的bert_base模型），如果Top-K组合总是固定的，可将其预先合成为一个“复合LoRA”（$W' = W_{\text{base}} + \sum w_i \Delta W_i$），以降低推理时的计算开销。7. 专家模块的导出与导入 (Serialization)目标: 每个训练好的专家必须能被序列化为一个独立的文件。数据格式 (JSON/HDF5):JSON{
-  "base_model_hash": "sha256:tlm-base-v1.2-abc...", // 确认此专家所依赖的基座
-  "expert_id": "v100_conv2d_small_batch_expert_v1",
-  "architecture": {
-    "dim": 768, 
-    "lora_rank": 16
-  },
-  "routing": {
-    "router_row_v1": "[... 768个浮点数 ...]", // r_i
-    "expert_bias_v1": -0.85                   // b_i
-  },
-  "lora_weights": { // 存储在HDF5或.bin文件中
-    "lora_A_path": "expert_v1.bin",
-    "lora_B_path": "expert_v1.bin" 
-  },
-  "metadata": {
-    "source_data_hash": "...",
-    "training_stats": {
-      "avg_gate": 0.15,
-      "avg_uplift_ms": 1.2
-    }
-  }
-}
-全局路由矩阵: 在服务启动时，遍历所有加载的专家JSON，torch.stack()所有router_row，并torch.stack()所有expert_bias，构建成服务端的全局nn.Parameter（或buffer）。8. 监控与度量 (Monitoring)[AI助手指南]：训练日志(Logger)必须上报以下关键指标：E[g] (平均开门率): [最重要] 观察g_i.mean()。它不应塌缩到0或1。Loss Breakdown: 必须分别记录 $\mathcal{L}_{\text{task}}$, $\mathcal{L}_{\text{gate\_align}}$, $\mathcal{L}_{\text{sparse}}$ 等，以便调试超参 $\lambda$。b_i (偏置值): 监控 $b_i$ 的值，确保它保持在负数。Uplift Distribution: 记录 $lat_{\text{base}} - lat_{\text{lora}}$ 的直方图，证明LoRA在正向收益。Cache Hit Rate: 监控BaseLatencyCache的命中率，评估成本控制效果。
+## 概述
+
+- **目标**：在冻结的 `TLM-BASE` 上，以“可插拔 LoRA 专家 + 单行路由”实现模块化优化与可审计合并。  
+- **亮点**：免联合训练、本地可训练并上架、Top-K 稀疏推理、随时退出/撤销。
+
+## 目录结构（建议）
+
+```
+project/
+  experts/
+    <org>/<hw>/<tag>/
+      adapter_model.bin
+      adapter_config.json
+      router.json           # { "r": [...], "b": -0.7, "tau": 2.0, "meta": {...} }
+      metrics.json          # 可选
+  src/
+    gating.py               # GatedLoRAExpert, BasePlusExperts
+    train_single_expert.py  # 单专家训练脚本（配对：BASE vs BASE+LoRA）
+    infer_multi_experts.py  # 多专家 Top-K 推理
+    latency_cache.py        # BaseLatencyCache + 抽查刷新
+    proxy_score.py          # (可选) 代理收益模型
+```
+
+## 关键前向（训练期：单专家）
+
+\[
+y = y_{\text{base}} + g(x)\cdot \Delta y,\quad 
+g(x)=\sigma\!\Big(\frac{r^\top x+b}{\tau}\Big),\ b=-\mathrm{softplus}(\beta)\le0
+\]
+
+- `y_base`：`base(x).detach()`（完全冻结基座）  
+- `Δy`：LoRA 的输出增量  
+- `r`：单行路由向量；`b`：负偏置；`τ`：温度（可退火/可学习）
+
+### 推荐初始化
+- LoRA：`B=0`、`A` Kaiming/Normal（初始增量为 0，前向稳定）  
+- `r`：用硬件/领域嵌入的**均值**作起点  
+- `b`：负值（如 `-1.0`）；`τ`：2.0 起步逐步退火到 1.0/0.5
+
+## 训练循环（兼容你的 SFT 闭环）
+
+```python
+# train_single_expert.py
+for step, batch in enumerate(loader):
+    x, y_star = batch["x"], batch["y"]
+    with torch.no_grad():
+        y_base = base(x)               # 冻结
+    delta = lora(x)
+    s = (x @ r) + (-F.softplus(beta))  # b<=0
+    g = torch.sigmoid(s / tau)
+    y = y_base + g * delta
+
+    loss = L_task(y, y_star)
+    if use_gain:
+        gain = (lat_base(batch) - lat_base_plus_lora(batch))  # 真机/代理/缓存+抽查
+        loss = loss + λ_gain * F.relu(gain - margin)
+
+    loss = loss + λ_r * (r.norm()**2) + λ_H * entropic_reg(g)
+    loss.backward()
+    opt.step(); opt.zero_grad()
+```
+
+- **仅优化**：LoRA(A/B)、`r`、`beta`（与可选的 `tau`）  
+- **不优化**：任何 Base 参数（emb/attn/ffn/ln/head 全冻结）
+
+## 合并与推理（中心侧：多专家 Top-K）
+
+```python
+# infer_multi_experts.py
+@torch.no_grad()
+def infer_topk(x, base, experts, K=2, tau=1.0, mask=None):
+    yb = base(x)                         # 冻结
+    scores, deltas, names = [], [], []
+    for name, e in experts.items():
+        if mask and not mask.get(name, True): continue
+        b = -F.softplus(e.beta)
+        s = (x @ e.r) + b                # [N]
+        d = e.lora(x)                    # Δy
+        scores.append(s); deltas.append(d); names.append(name)
+    # BASE 的隐式 0 分通道
+    S = torch.stack([torch.zeros_like(scores[0])] + scores, dim=0)  # [1+E,N]
+    # Top-K 截断（忽略 BASE 这一行）
+    topk_vals, topk_idx = torch.topk(torch.stack(scores), k=min(K, len(scores)), dim=0)
+    mask_mat = torch.zeros_like(S, dtype=torch.bool)
+    for i, idx in enumerate(topk_idx): mask_mat[1:,:,][(idx, torch.arange(S.size(1)))] = True
+    S = torch.where(mask_mat, S, torch.full_like(S, -1e9))
+    w = F.softmax(S / tau, dim=0)        # [1+E,N]
+    y = yb + sum(w[i+1].unsqueeze(-1)*deltas[i] for i in range(len(deltas)))
+    return y, {"weights": w, "names": ["BASE"]+names}
+```
+
+- **BASE 通道**的 0 分“兜底”保证未被专家解释的成分回落到 Base。  
+- 支持 **mask** 精准退出/隔离专家（行级屏蔽）。
+
+## BaseLatencyCache 与代理收益
+
+- 为每类算子/张量句子缓存 **BASE 延迟**（按形状/算子签名键控）  
+- 训练时计算 `gain = lat(BASE) - lat(BASE+LoRA)`：
+  - 优先用**代理模型**估计（快速）
+  - 每 N 步**抽查真机**校准（可靠）
+  - `L_gain = λ·ReLU(gain - margin)` 只在“明显有益”时鼓励更大门控
+
+## 指标与看板（最小集）
+
+- 门控分布直方图（`g` 或 `w`）  
+- 专家激活热力图（token/样本维度）  
+- 端到端加速与回退率（BASE vs BASE+LoRA）  
+- 专家健康度（贡献度、覆盖度、冲突率）
+
+## 分发协议（产物规范）
+
+```
+experts/<org>/<hw>/<tag>/
+  adapter_model.bin
+  adapter_config.json
+  router.json        # { "r": [...], "b": -0.7, "tau": 2.0, "meta": {...} }
+  metrics.json       # { "train_loss": ..., "gain@p50": ..., "gain@p90": ... }
+```
+
+- 聚合端：扫描 → 加载 LoRA → 拼接路由矩阵 → 推理  
+- 治理：按 org/hw/tag 白名单或黑名单，对路由矩阵行做屏蔽
+
+## 迁移旧版（HA+HS）
+
+- 删除 HA 分支；每个 HS → `{LoRA, r, b}` 配对训练；  
+- 旧的“硬件路由表” → 专家屏蔽表（面向治理）；  
+- 旧脚本的“联合前向” → 新脚本的“BASE + 门控增量”。
+
+## 超参数建议（起点）
+
+- `rank`: 8/16/32（依模型大小与预算）  
+- `tau`: 2.0 → 1.0（线性退火）  
+- `b`: 初值 -1.0（经 `-softplus` 参数化）  
+- `λ_gain`: 0.1 ～ 0.5；`margin`: 3% ～ 8%（相对延迟提升）  
+- `λ_r`: 1e-4；门控熵正则 `λ_H`: 1e-4  
+- 优化器：AdamW，LoRA/路由分别可用不同 lr（如 1e-4 / 5e-4）
+
+## 常见问题
+
+- **Q：没有其他专家参与，路由能学起来吗？**  
+  A：可以。我们把问题化成“BASE vs BASE+LoRA”两路对比，路由学“该开多大”，不需显式与他人竞争。
+
+- **Q：冷启动会不会不稳定？**  
+  A：不会。LoRA 初始增量为 0，前向=BASE；梯度通过连续门 \(g\) 直接到 LoRA，第一步就能学习。
+
+- **Q：为什么要负偏置？**  
+  A：让专家“更挑活儿”，只有当确实有收益时才显著打开；合并后稳定、可审计。
+
+
+  阶段 1：冻结 BASE 并抽象专家接口
+
+目的：把旧的 HA/HS 逻辑切到“Frozen TLM-BASE + 可插拔 LoRA 专家”的新接口，但不改变现有训练循环的其它部分。
+
+新增 FrozenBaseWrapper
+
+路径：src/python/tlm/modeling/frozen_base.py
+
+要点：
+
+base.eval()（禁用 dropout 等），param.requires_grad_(False)
+
+forward() 返回 logits 或你习惯的中间隐表示；记得 .detach()
+
+可选：暴露 get_router_feature(x)（例如取某层隐状态平均或硬件 embedding 作为路由输入 z）
+
+# frozen_base.py
+class FrozenBaseWrapper(nn.Module):
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.base = base_model.eval()
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def forward(self, x, **kw):
+        # 返回 logits（或你项目里约定的 “张量句子” 表示）
+        return self.base(x, **kw)
+
+    @torch.no_grad()
+    def router_feature(self, hidden_states=None, hw_emb=None):
+        # 任选一种。建议优先硬件/簇 embedding，其次某层隐状态均值
+        if hw_emb is not None:
+            return hw_emb
+        assert hidden_states is not None
+        return hidden_states.mean(dim=1)  # [B, H]
+
+
+新增 专家接口与注册表
+
+路径：src/python/tlm/modeling/experts/interface.py
+
+内容：
+
+GatedExpertMixin（定义 forward_delta(x) -> Δlogits、gate_inputs(...) -> z、gate_score(z) -> s、serialize/deserialize）
+
+ExpertRegistry（register(name, expert) / load(path) / save(path)）
+
+# experts/interface.py
+class GatedExpertMixin(Protocol):
+    def forward_delta(self, x, **kw): ...
+    def gate_inputs(self, *, hidden_states=None, hw_emb=None): ...
+    def gate_score(self, z): ...
+    def serialize(self, path): ...
+    @classmethod
+    def deserialize(cls, path): ...
+
+class ExpertRegistry:
+    def __init__(self):
+        self._experts = OrderedDict()
+    def register(self, name: str, expert: GatedExpertMixin):
+        self._experts[name] = expert
+    def items(self):
+        return list(self._experts.items())
+
+
+训练脚本接入 FrozenBaseWrapper + ExpertRegistry
+
+在 gen/MosLora/train_mt_moslora.py（或你当前入口）里，把原本直接调模型的地方改成：
+
+y_base = frozen_base(x).detach()
+
+暂时只挂一个“占位专家”（下一阶段实现真正的 LoRA 专家类）
+
+先不动旧 HA/HS 的数据加载与日志，确保接口层变更可通过单测。
+
+单元测试（最小）
+
+tests/python/tlm/test_expert_registry.py：注册、保存、加载
+
+tests/python/tlm/test_frozen_base.py：确认所有参数 requires_grad=False，forward() 无梯度，输出张量不参与反传。
+
+阶段 2：实现 Gated LoRA 专家（单行路由 + 负偏置）
+
+目的：把“BASE vs BASE+LoRA”的两路对比做成可训练的专家单元。
+
+新增 GatedLoRAExpert
+
+路径：src/python/tlm/modeling/experts/gated_lora.py
+
+关键参数：LoRA(A/B)、r ∈ ℝ^h、beta（通过 b=-softplus(beta)≤0）、tau（温度）
+
+初始化：B=0，A Kaiming/Normal；r 用硬件/领域 embedding 均值初始化；beta 使 b≈-1.0；tau=2.0
+
+class GatedLoRAExpert(nn.Module, GatedExpertMixin):
+    def __init__(self, lora_modules, r_dim: int, tau_init=2.0, b_init=-1.0):
+        super().__init__()
+        self.lora = lora_modules  # 你现有的 LoRA 封装
+        self.r = nn.Parameter(torch.zeros(r_dim))       # 之后用均值向量覆盖
+        self.beta = nn.Parameter(torch.tensor(0.))      # b = -softplus(beta)
+        self.register_buffer("tau", torch.tensor(tau_init))
+        with torch.no_grad():
+            self.beta.copy_(torch.log(torch.exp(torch.tensor(-b_init)) - 1.))  # softplus^-1
+
+    def forward_delta(self, x, **kw):
+        return self.lora(x, **kw)  # Δlogits
+
+    def gate_inputs(self, *, hidden_states=None, hw_emb=None):
+        return hw_emb if hw_emb is not None else hidden_states.mean(dim=1)
+
+    def gate_score(self, z):
+        b = -F.softplus(self.beta)
+        s = (z * self.r).sum(dim=-1) + b   # [B]
+        return s / self.tau
+
+    def serialize(self, path):
+        # 保存 LoRA 权重 + r/b/tau
+        ...
+
+    @classmethod
+    def deserialize(cls, path):
+        ...
+
+
+新增 汇总容器 BasePlusExperts
+
+路径：src/python/tlm/modeling/base_plus_experts.py
+
+训练期（单专家）：y = y_base + σ(s)*Δy
+
+推理期（多专家）：Top-K + Softmax（第 0 通道是 BASE 的 0 分）
+
+class BasePlusExperts(nn.Module):
+    def __init__(self, base: FrozenBaseWrapper, registry: ExpertRegistry):
+        super().__init__()
+        self.base = base
+        self.registry = registry
+
+    def forward_single(self, x, *, hidden_states=None, hw_emb=None, expert_name:str):
+        yb = self.base(x).detach()
+        name, e = expert_name, dict(self.registry.items())[expert_name]
+        z = e.gate_inputs(hidden_states=hidden_states, hw_emb=hw_emb)
+        s = e.gate_score(z)                  # [B]
+        g = torch.sigmoid(s)                 # [B]
+        dy = e.forward_delta(x)
+        return yb + g.unsqueeze(-1) * dy
+
+    @torch.no_grad()
+    def forward_multi(self, x, *, hidden_states=None, hw_emb=None, topk=2, tau=1.0, mask=None):
+        yb = self.base(x)
+        scores, deltas = [], []
+        for name, e in self.registry.items():
+            if mask and not mask.get(name, True): continue
+            z = e.gate_inputs(hidden_states=hidden_states, hw_emb=hw_emb)
+            s = e.gate_score(z)              # [B]
+            d = e.forward_delta(x)           # Δlogits
+            scores.append(s); deltas.append(d)
+        S = torch.stack([torch.zeros_like(scores[0])] + scores, dim=0)  # 含 BASE 的 0 分
+        idx = torch.topk(torch.stack(scores), k=min(topk, len(scores)), dim=0).indices
+        mask_mat = torch.zeros_like(S, dtype=torch.bool)
+        for i, idb in enumerate(idx):
+            mask_mat[1:,:,][(idb, torch.arange(S.size(1)))] = True
+        S = torch.where(mask_mat, S, torch.full_like(S, -1e9))
+        W = F.softmax(S / tau, dim=0)        # [1+E, B]
+        y = yb + sum(W[i+1].unsqueeze(-1) * deltas[i] for i in range(len(deltas)))
+        return y, W
+
+阶段 3：Loss 模块（含冷启动）
+
+目的：把我们讨论的损失函数落成独立模块，便于训练脚本调用。
+
+路径：src/python/tlm/training/losses.py
+
+暴露：
+
+compute_task_loss(logits, targets)（你现有的 SFT/CLM）
+
+compute_gain_loss(I_pct, g_mean, step, warmup_steps, m_target, lambda_gain, eps=0.005)（冷启动屏蔽 + 退火门槛）
+
+entropy_reg(g, lambda_H)、l2r_reg(r, lambda_r)
+
+def compute_gain_loss(I_pct, g_mean, step, warmup_steps, m_target, lambda_gain, eps=0.005):
+    M = ((I_pct >= eps) or (step >= warmup_steps))
+    m_t = 0.0 if step < warmup_steps else anneal_linear(0.0, m_target, step-warmup_steps)
+    return lambda_gain * float(M) * g_mean * F.relu(m_t - I_pct)
+
+阶段 4：训练脚本改造（单专家本地训练）
+
+目的：接入“全量真测”的收益，计算 I_%，按总损失训练 {LoRA, r, beta, (tau)}。
+
+核心循环（伪代码）：
+
+frozen = FrozenBaseWrapper(load_base(...))
+reg = ExpertRegistry(); reg.register(args.name, GatedLoRAExpert(...))
+system = BasePlusExperts(frozen, reg)
+
+opt = AdamW([
+    {"params": reg._experts[args.name].lora.parameters(), "lr": lr_lora},
+    {"params": [reg._experts[args.name].r, reg._experts[args.name].beta], "lr": lr_router},
+    # 可选：tau
+], weight_decay=...)
+
+for step, batch in enumerate(loader):
+    x, y_star, hw_emb = batch["x"], batch["y"], batch["hw_emb"]
+    # 1) 前向
+    y_base = frozen(x).detach()
+    delta  = reg._experts[args.name].forward_delta(x)
+    z      = reg._experts[args.name].gate_inputs(hw_emb=hw_emb)  # or hidden_states
+    s      = reg._experts[args.name].gate_score(z)
+    g      = torch.sigmoid(s)
+    y      = y_base + g.unsqueeze(-1) * delta
+
+    # 2) 任务损失
+    L_task = compute_task_loss(y, y_star)
+
+    # 3) 你的“全量真测”结果（同批生成）
+    # base_candidates, lora_candidates 都已实测
+    lat_base_star = batch["lat_base_star"]      # min latency among BASE candidates
+    lat_lora_star = batch["lat_lora_star"]      # min latency among BASE+LoRA candidates
+    I_pct = (lat_base_star - lat_lora_star) / lat_base_star
+
+    # 4) 门控收益（带冷启动）
+    L_gain = compute_gain_loss(
+        I_pct=I_pct.mean(), g_mean=g.mean(),
+        step=step, warmup_steps=args.warmup,
+        m_target=args.gain_margin, lambda_gain=args.lambda_gain
+    )
+
+    # 5) 正则
+    L_reg = l2r_reg(reg._experts[args.name].r, args.lambda_r) \
+          + entropy_reg(g, args.lambda_H)
+
+    # 6) 总损失与反传
+    L = L_task + L_gain + L_reg
+    opt.zero_grad(); L.backward(); opt.step()
+
+
+注意点
+
+BASE 一定要 detach()（或整个 FrozenBaseWrapper.forward 用 @torch.no_grad()）
+
+LoRA 初值：B=0 保证首轮前向稳定；梯度能通过 g*Δ 路径流到 LoRA
+
+冷启动：warmup_steps 内将 L_gain 屏蔽或门槛置 0
+
+超参起点：tau: 2.0→1.0 退火；b_init ≈ -1.0；λ_gain: 0.1~0.5；margin m: 3%~8%；λ_r=1e-4；λ_H=1e-4（前期负数鼓励高熵）
+
+阶段 5：合并与推理（多专家）
+
+目的：无训练合并；Top-K 稀疏路由；支持专家屏蔽/撤销。
+
+路径：src/python/tlm/infer/infer_multi_experts.py
+
+加载多个 {adapter_model.bin, adapter_config.json, router.json}，注册到 ExpertRegistry
+
+前向调用 BasePlusExperts.forward_multi(x, hw_emb=...)
+
+提供 CLI：
+
+--experts_root、--topk、--mask "org/hw/tag:0"、--tau
+
+输出每条样本的 weights（含 BASE 通道）、命中专家列表（便于审计）
+
+阶段 6：专家产物规范与序列化
+
+目录结构（与我们文档一致）：
+
+experts/<org>/<hw>/<tag>/
+  adapter_model.bin
+  adapter_config.json
+  router.json   # { "r": [...], "b": -0.7, "tau": 2.0, "meta": {...} }
+  metrics.json  # { "train_loss": ..., "gain@p50": ..., "gain@p90": ... }
+
+
+router.json 里保存 r（list）、b（标量）、tau（标量）、meta（硬件/许可证/作者等）
+
+serialize/deserialize 对应落地
+
+阶段 7：指标与看板（最小闭环）
+
+训练期：
+
+g 的分布（均值/直方图）
+
+I_% 的分布与 L_gain 命中率（warmup 后）
+
+推理期：
+
+Top-K 权重热力图（含 BASE 通道）
+
+专家激活频率 / 冲突率
+
+端到端收益（BASE vs 多专家）
+
+阶段 8：迁移旧 HS → 新专家
+
+逐个 HS LoRA：
+
+载入旧权重 → 包装成 GatedLoRAExpert
+
+r 初始化为该簇/硬件的均值 embedding；b≈-1.0；tau=2.0
+
+用你的“全量真测”+SFT 流，按阶段 4 做一轮配对训练（BASE vs BASE+LoRA）
+
+导出 {adapter_*.bin, router.json}，注册到中心侧即可推理
+
+你给的第 1 步清单，逐条反馈
+
+FrozenBaseWrapper：✅ 正确；建议同时 eval() 与 requires_grad_(False)；forward 默认 @torch.no_grad()，或返回后 .detach()。
+
+GatedExpertMixin & ExpertRegistry：✅ 很好；Mixin 里加上 gate_score、forward_delta 两个强约束方法。
+
+训练脚本过渡：✅ 先通过接口跑通（哪怕专家暂时是 dummy），保留旧日志与评估，降低风险。
+
+单测：✅ 必要；另外加一个“前向梯度流”测试：确认 y_base 无梯度，Δ 与 r/b 有梯度。
+
+
+
+
+我们把每个 LoRA 的启用度建模为一个连续门控 
+(z)∈[0,1]，它由“路由向量” 
+ 与当前条件 的匹配度经 Sigmoid/Softmax 得到。
+训练阶段，
+	​
+
+ 在“BASE vs BASE+LoRA”的对比监督（含真实收益 
+
+）下，自动学成“这条 LoRA 在此条件下应当开启的强度”；
+推理阶段，我们用
+ 排序并取 Top-K，即选择“最值得开启”的若干 LoRA，按其强度做加权合成。
+这将“该不该开”与“开多大”统一在一个可微的连续门控里，既继承了 MoE 的选择性，又避免了硬开关的不稳定。
