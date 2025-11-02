@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Type, TypeVar
+from collections import OrderedDict
+from typing import Any, Dict, Iterable, Tuple
 
 
 class GatedExpertMixin(ABC):
@@ -37,33 +38,43 @@ class GatedExpertMixin(ABC):
         """Restore an expert from serialized state."""
 
 
-T = TypeVar("T", bound=GatedExpertMixin)
-
-
 class ExpertRegistry:
-    """Simple registry for mapping expert names to their implementations."""
+    """Registry that keeps expert instances for gating."""
 
     def __init__(self):
-        self._registry: Dict[str, Type[T]] = {}
+        self._experts: "OrderedDict[str, GatedExpertMixin]" = OrderedDict()
 
-    def register(self, name: str, expert_cls: Type[T]) -> None:
-        if not issubclass(expert_cls, GatedExpertMixin):
-            raise TypeError("expert_cls must inherit from GatedExpertMixin")
-        self._registry[name] = expert_cls
+    def register(self, name: str, expert: GatedExpertMixin) -> None:
+        if not isinstance(expert, GatedExpertMixin):
+            raise TypeError("expert must inherit from GatedExpertMixin")
+        self._experts[name] = expert
 
-    def get(self, name: str) -> Type[T]:
-        if name not in self._registry:
+    def get(self, name: str) -> GatedExpertMixin:
+        if name not in self._experts:
             raise KeyError(f"Expert '{name}' is not registered")
-        return self._registry[name]
+        return self._experts[name]
 
-    def create(self, name: str, *args: Any, **kwargs: Any) -> T:
-        expert_cls = self.get(name)
-        return expert_cls(*args, **kwargs)
+    def unregister(self, name: str) -> None:
+        if name in self._experts:
+            self._experts.pop(name)
 
-    def registered(self) -> List[str]:
-        return sorted(self._registry.keys())
+    def names(self) -> Iterable[str]:
+        return list(self._experts.keys())
 
     def clear(self) -> None:
-        self._registry.clear()
+        self._experts.clear()
 
+    def items(self) -> Iterable[Tuple[str, GatedExpertMixin]]:
+        return list(self._experts.items())
 
+    def state_dict(self) -> Dict[str, Dict[str, Any]]:
+        """Serialize all registered experts."""
+        return {name: expert.serialize() for name, expert in self._experts.items()}
+
+    def load_state_dict(self, state: Dict[str, Dict[str, Any]]) -> None:
+        """Restore experts from serialized state. Caller必须已注册对应专家实例或占位符."""
+        for name, expert_state in state.items():
+            if name not in self._experts:
+                raise KeyError(f"Expert '{name}' is not registered, cannot load state.")
+            expert_cls = type(self._experts[name])
+            self._experts[name] = expert_cls.deserialize(expert_state)
