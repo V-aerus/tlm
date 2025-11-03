@@ -2,7 +2,7 @@
 
 from .frozen_base import FrozenBaseWrapper
 from .base_plus_experts import BasePlusExperts
-from .experts import ExpertRegistry, GatedExpertMixin, GatedLoRAExpert
+from .experts import ExpertRegistry, GatedExpertMixin, GatedLoRAExpert, PeftDeltaWrapper
 
 __all__ = [
     "FrozenBaseWrapper",
@@ -10,4 +10,5 @@ __all__ = [
     "ExpertRegistry",
     "GatedExpertMixin",
     "GatedLoRAExpert",
+    "PeftDeltaWrapper",
 ]

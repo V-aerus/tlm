@@ -40,6 +40,11 @@
 # EdgeTLM 更新记录（阶段二筹备）
 
 ## 本次更新（2025-XX-XX）
+- 新增 `prepare_edge_dataset.py`，将 `all_gen_best_multi` 样本转化为包含 `hw_emb`、`lat_base_star` 的 JSONL，便于后续训练。
+- 新增 `train_edge_expert.py`，串联 `FrozenBaseWrapper`、`BasePlusExperts`、`GatedLoRAExpert` 与损失模块，实现单专家训练并兼容缺失 `lat_lora_star` 的冷启动。
+- `utils.py` 支持 `TLM_DATA_ROOT` 环境变量，适配当前仓库目录。
+- `gen_state.py` 接入 `BasePlusExperts.forward_multi`，支持加载多专家目录并按 Top-K 门控生成。
+- `train_edge_expert.py` 现导出 `{adapter_model.bin, adapter_config.json, router.json, metrics.json}`，`router.json.meta` 记录硬件信息与训练配置，以便专家上线与审计。
 - 建模层新增 `modeling/experts/gated_lora.py` 与 `modeling/base_plus_experts.py`，实现单行路由 LoRA 专家及 `BasePlusExperts` 组合容器。
 - 扩展 `modeling/__init__.py`、`modeling/experts/__init__.py`、`modeling/experts/interface.py`，统一导出接口并支持实例级注册/序列化。
 - 新增训练损失模块 `training/losses.py`（含任务损失、增益惩罚、熵正则、路由 L2）及 `training/__init__.py` 导出入口。
@@ -47,8 +52,8 @@
 
 
 ## TODO
-- [ ] 落地 Edge 专家训练脚本（`train_edge_expert.py`）并迁移现有 SFT 流程。基于新模块实现 train_edge_expert.py（或改造现有脚本），替换原 HA/HS 流程，串联 FrozenBaseWrapper → ExpertRegistry →GatedLoRAExpert → BasePlusExperts。
-- [ ] 为 SFT 数据集补充 `hw_emb`、`lat_base_star`、`lat_lora_star` 等字段，或设计代理测量路径。确保 compute_gain_loss 可用。
-- [ ] 调整 `gen_state.py` 等推理脚本，引入 `BasePlusExperts.forward_multi` 与 Top-K 管理。
-- [ ] 统一导出 `{adapter_model.bin, adapter_config.json, router.json, metrics.json}`，实现专家序列化/反序列化。
+- [x] 落地 Edge 专家训练脚本（`train_edge_expert.py`）并迁移现有 SFT 流程。
+- [x] 为 SFT 数据集补充 `hw_emb`、`lat_base_star`、`lat_lora_star` 等字段，或设计代理测量路径。确保 compute_gain_loss 可用。
+- [x] 调整 `gen_state.py` 等推理脚本，引入 `BasePlusExperts.forward_multi` 与 Top-K 管理。
+- [x] 统一导出 `{adapter_model.bin, adapter_config.json, router.json, metrics.json}`，实现专家序列化/反序列化。
 - [ ] 编写/更新单元测试（冻结基座、专家注册与序列化、门控前向梯度）。

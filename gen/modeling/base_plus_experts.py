@@ -38,7 +38,8 @@ class BasePlusExperts(nn.Module):
         hw_emb: Optional[torch.Tensor] = None,
         base_kwargs: Optional[Dict] = None,
         expert_kwargs: Optional[Dict] = None,
-    ) -> torch.Tensor:
+        cached_base: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
         """训练期：单专家前向，返回 y = y_base + σ(g)*Δy。"""
         if base_kwargs is None:
             base_kwargs = {}
@@ -47,8 +48,11 @@ class BasePlusExperts(nn.Module):
 
         expert = self.registry.get(expert_name)
 
-        with torch.no_grad():
-            y_base = self.base(x, **base_kwargs)
+        if cached_base is None:
+            with torch.no_grad():
+                y_base = self.base(x, **base_kwargs)
+        else:
+            y_base = cached_base
 
         z = expert.gate_inputs(hidden_states=hidden_states, hw_emb=hw_emb)
         g = expert.gating_weight(z)
@@ -68,6 +72,7 @@ class BasePlusExperts(nn.Module):
         mask: Optional[Dict[str, bool]] = None,
         base_kwargs: Optional[Dict] = None,
         expert_kwargs: Optional[Dict] = None,
+        cached_base: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """推理期：按 Top-K 稀疏路由融合多个专家。"""
         if base_kwargs is None:
@@ -75,7 +80,10 @@ class BasePlusExperts(nn.Module):
         if expert_kwargs is None:
             expert_kwargs = {}
 
-        y_base = self.base(x, **base_kwargs)
+        if cached_base is None:
+            y_base = self.base(x, **base_kwargs)
+        else:
+            y_base = cached_base
 
         scores = []
         deltas = []

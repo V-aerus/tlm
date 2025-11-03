@@ -1,7 +1,8 @@
 import os
 import json
 
-utils_json_path = "/home/hangshuaihe/tlm/tlm_dataset/gen/utils.json"  # 使用绝对路径
+_DEFAULT_DATA_ROOT = "/home/hehangshuai/workspace/tlm/tlm_dataset/gen"
+utils_json_path = os.path.join(os.environ.get("TLM_DATA_ROOT", _DEFAULT_DATA_ROOT), "utils.json")
 utils_json = None
 
 def get_utils_json(key):

@@ -508,6 +508,73 @@ GatedExpertMixin & ExpertRegistry：✅ 很好；Mixin 里加上 gate_score、fo
 
 单测：✅ 必要；另外加一个“前向梯度流”测试：确认 y_base 无梯度，Δ 与 r/b 有梯度。
 
+## TODO（代码实现）
+
+- [ ] 调整 `gen_state.py` 日志输出，记录 Top-K 专家权重便于审计。
+- [ ] 编写/更新单元测试（冻结基座、专家注册与序列化、门控前向梯度）。
+
+## EdgeTLM 操作指南（2025-XX-XX）
+
+### 1. 导出硬件专属训练语料
+
+`prepare_edge_dataset.py` 会读取 `all_gen_best_multi` 数据集中已有的张量句子，为样本注入硬件向量与基线延迟。建议针对每个硬件分别导出：
+
+```bash
+# V100
+python prepare_edge_dataset.py \
+  --sft-dataset-path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/multi_iterative_v1_dataset/multi_sft_dataset_iter1/all_gen_best_multi \
+  --hardware-id v100 \
+  --tokenizer-path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/gen_tokenizer_multi_v1 \
+  --output-jsonl /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_sft_v100.jsonl
+
+# Xavier
+python prepare_edge_dataset.py ... --hardware-id xavier --output-jsonl /.../edge_sft_xavier.jsonl
+
+# RTX4090
+python prepare_edge_dataset.py ... --hardware-id 4090 --output-jsonl /.../edge_sft_4090.jsonl
+
+# Xeon
+python prepare_edge_dataset.py ... --hardware-id xeon --output-jsonl /.../edge_sft_xeon.jsonl
+```
+
+- `--hardware-id` 支持单值或逗号分隔列表；不指定则导出所有样本。
+- 若数据集中没有原始 `text` 字段，需提供 `--tokenizer-path` 以便解码 `input_ids`。
+- 初次迭代暂无 `lat_lora_star`，脚本默认将其置为 `None`，后续训练会按冷启动策略处理。
+
+### 2. 训练单个 LoRA 专家
+
+```bash
+python train_edge_expert.py \
+  --base-model-path /path/to/base_model \
+  --tokenizer-path /path/to/tokenizer \
+  --dataset-jsonl /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_sft_v100.jsonl \
+  --output-dir /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_expert_v100 \
+  --num-epochs 3 \
+  --lambda-gain 0.0 \
+  --warmup-steps 200
+```
+
+- 首轮训练建议 `lambda-gain=0` 或保留较长 `warmup_steps`，避免在缺失 `lat_lora_star` 的情况下错误驱动门控。
+- 产物包括 LoRA 适配器、`router.json`、`metrics.json`，可直接放入专家目录 (`experts/<org>/<hw>/<tag>/` )。
+
+### 3. 确认 utils.json
+
+`utils.py` 会优先读取环境变量 `TLM_DATA_ROOT`（默认 `/home/hehangshuai/workspace/tlm/tlm_dataset/gen`）。运行前请确保 `utils.json` 中记录了最新的测量路径；必要时参考 `run_iterative_postprocess.sh` 的写法手动追加。
+
+### 4. 真机测量与增量训练
+
+- 使用现有脚本（`gen_state.py` + postprocess）在目标硬件上生成新 schedule、采集 `lat_lora_star`。
+- 重新运行 `prepare_edge_dataset.py` 追加 LoRA 延迟后，再次执行 `train_edge_expert.py`，逐步提升 `lambda-gain` 并调节温度。
+
+## 实验操作建议
+
+1. **整理基线数据**：针对 V100、Xavier、RTX4090、Xeon 分别运行 `prepare_edge_dataset.py`，生成带 `hw_emb` 与 `lat_base_star` 的 JSONL 文件。
+2. **训练单专家**：使用 `train_edge_expert.py` 分别在四份 JSONL 上训练 LoRA 专家，首轮保持 `lambda-gain=0` 或较长 `warmup_steps`。
+3. **整理专家目录**：将每个专家的 `adapter_model.bin`、`adapter_config.json`、`router.json`、`metrics.json` 放入 `experts/<org>/<hw>/<tag>/`，便于推理脚本读取。
+4. **推理验证**：运行 `gen_state.py --edge_expert_dirs`，确认新的门控推理链路正常工作。
+5. **真机测量**：按原流程执行生成与测量脚本，收集 LoRA 延迟并更新 `utils.json`。
+6. **增量训练**：基于最新测量结果重新导出 JSONL，逐步提升 `lambda-gain`，进行后续迭代。
+
 
 
 

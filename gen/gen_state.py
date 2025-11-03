@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
 from transformers import HfArgumentParser
 from tvm import auto_scheduler
 from tvm.auto_scheduler.measure_record import load_record_from_string
@@ -39,6 +40,14 @@ except Exception:
     apply_mt_moslora_to_model = None
     ModelArguments = None
 
+from modeling import (
+    BasePlusExperts,
+    ExpertRegistry,
+    FrozenBaseWrapper,
+    GatedLoRAExpert,
+    PeftDeltaWrapper,
+)
+
 
 @dataclass
 class ScriptArguments:
@@ -52,6 +61,9 @@ class ScriptArguments:
     # 新增适配器参数
     adapter_path: str = field(default=None, metadata={"help": "Path to a single LoRA/MoSLORA adapter (PEFT)"})
     multi_adapter_dir: str = field(default=None, metadata={"help": "Path to directory containing multiple HA/HS adapter files"})
+    edge_expert_dirs: str = field(default=None, metadata={"help": "Comma-separated directories containing EdgeTLM experts"})
+    edge_embedding_path: str = field(default="Embedding/hardware_embeddings_v2.json", metadata={"help": "Hardware embedding json path"})
+    edge_topk: int = field(default=1, metadata={"help": "Top-K experts to activate during inference"})
     
     # 硬件路由参数
     target_hardware: str = field(default=None, metadata={"help": "Target hardware type for MT-MoSLoRA (e.g., v100, xavier, i7)"})
@@ -121,6 +133,31 @@ def extract_hardware_id_from_target(target) -> str:
         return "v100"
 
 
+EDGE_EMBEDDING_DEFAULTS = {
+    "v100": "nvidia/nvidia-v100",
+    "4090": "nvidia/nvidia-a40",
+    "xavier": "nvidia/jetson-agx-xavier",
+    "xeon": "aws/cpu/c5.18xlarge",
+}
+
+
+def load_hardware_embeddings(path: str) -> Dict[str, List[float]]:
+    with open(path, "r", encoding="utf-8") as f:
+        entries = json.load(f)
+    return {entry["hardware_name"]: entry["vector"] for entry in entries}
+
+
+def resolve_hw_embedding(hardware_id: str, embeddings: Dict[str, List[float]]) -> Tuple[str, List[float]]:
+    if hardware_id in EDGE_EMBEDDING_DEFAULTS:
+        hw_name = EDGE_EMBEDDING_DEFAULTS[hardware_id]
+        if hw_name in embeddings:
+            return hw_name, embeddings[hw_name]
+    for name, vector in embeddings.items():
+        if hardware_id in name:
+            return name, vector
+    raise KeyError(f"No embedding found for hardware id '{hardware_id}'")
+
+
 def load_model_for_inference(args: ScriptArguments) -> tuple:
     """
     集中的模型加载函数 - 所有模型加载逻辑的唯一入口
@@ -138,6 +175,10 @@ def load_model_for_inference(args: ScriptArguments) -> tuple:
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     
     # 2. 模式判断 (核心逻辑)
+    expert_dirs = []
+    if args.edge_expert_dirs:
+        expert_dirs = [p.strip() for p in args.edge_expert_dirs.split(",") if p.strip()]
+
     if args.multi_adapter_dir:
         # 模式 C - MT-MoSLORA
         print("Mode C: Multi-adapter MT-MoSLoRA")
@@ -242,7 +283,95 @@ def load_model_for_inference(args: ScriptArguments) -> tuple:
         # 设置目标硬件
         print(f"Setting target hardware to {target_hardware}")
         set_target_hardware(model, target_hardware)
-        
+    elif expert_dirs:
+        if PeftModel is None:
+            raise ImportError("PEFT library not available. Please install peft.")
+
+        print("Mode D: EdgeTLM expert gating")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        print("Loading base model...")
+        base_model = AutoModelForCausalLM.from_pretrained(args.model_path)
+        base_model.to(device)
+        base_model.eval()
+        base_model.requires_grad_(False)
+
+        frozen_base = FrozenBaseWrapper(base_model)
+        embeddings = load_hardware_embeddings(args.edge_embedding_path)
+
+        hw_id = args.target_hardware or extract_hardware_id_from_target(args.target)
+        hw_name, hw_vector = resolve_hw_embedding(hw_id, embeddings)
+        hw_emb_tensor = torch.tensor(hw_vector, dtype=torch.float32, device=device)
+        print(f"Target hardware: {hw_id} ({hw_name})")
+
+        registry = ExpertRegistry()
+        for dir_path in expert_dirs:
+            resolved_dir = os.path.abspath(dir_path)
+            router_path = os.path.join(resolved_dir, "router.json")
+            if not os.path.exists(router_path):
+                raise FileNotFoundError(f"router.json not found in {resolved_dir}")
+            print(f"Loading Edge expert from {resolved_dir}")
+
+            expert_model = AutoModelForCausalLM.from_pretrained(args.model_path)
+            expert_model = PeftModel.from_pretrained(expert_model, resolved_dir)
+            expert_model.to(device)
+            expert_model.eval()
+            expert_model.requires_grad_(False)
+
+            delta_wrapper = PeftDeltaWrapper(expert_model)
+
+            with open(router_path, "r", encoding="utf-8") as rf:
+                router_state = json.load(rf)
+
+            r_vector = torch.tensor(router_state["r"], dtype=torch.float32, device=device)
+            expert = GatedLoRAExpert(delta_wrapper, r_dim=r_vector.numel(), init_router=r_vector)
+            beta_value = float(router_state.get("beta", float(expert.beta.detach().cpu())))
+            tau_value = float(router_state.get("tau", float(expert.tau.detach().cpu())))
+            with torch.no_grad():
+                expert.beta.fill_(beta_value)
+                expert.tau.fill_(tau_value)
+            expert.to(device)
+
+            expert_name = os.path.basename(resolved_dir.rstrip("/"))
+            registry.register(expert_name, expert)
+
+        system = BasePlusExperts(frozen_base, registry)
+        topk = max(1, args.edge_topk)
+
+        original_forward = base_model.forward
+
+        def edge_forward(*forward_args, **forward_kwargs):
+            input_ids = forward_kwargs.get("input_ids")
+            if input_ids is None and forward_args:
+                input_ids = forward_args[0]
+            if input_ids is None:
+                raise ValueError("EdgeTLM forward requires input_ids.")
+
+            attention_mask = forward_kwargs.get("attention_mask")
+            base_outputs = original_forward(*forward_args, **forward_kwargs)
+            base_logits = base_outputs.logits
+
+            batch_size = input_ids.shape[0]
+            hw_batch = hw_emb_tensor.unsqueeze(0).expand(batch_size, -1)
+
+            expert_kwargs = dict(forward_kwargs)
+            expert_kwargs["input_ids"] = input_ids
+            expert_kwargs["attention_mask"] = attention_mask
+            expert_kwargs["base_logits"] = base_logits
+
+            logits, meta = system.forward_multi(
+                input_ids,
+                hw_emb=hw_batch,
+                topk=topk,
+                expert_kwargs=expert_kwargs,
+                cached_base=base_logits,
+            )
+            base_outputs.logits = logits
+            base_outputs.edge_meta = meta
+            return base_outputs
+
+        base_model.forward = edge_forward
+        model = base_model
     elif args.adapter_path:
         # 模式 B - 单适配器 MoSLORA
         print("Mode B: Single-adapter MoSLoRA")
