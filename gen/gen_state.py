@@ -123,6 +123,8 @@ def extract_hardware_id_from_target(target) -> str:
     
     if "v100" in target_lower:
         return "v100"
+    elif "4090" in target_lower or "sm_86" in target_lower:
+        return "4090"
     elif "xavier" in target_lower:
         return "xavier"
     elif "i7" in target_lower or "intel" in target_lower:
@@ -767,10 +769,8 @@ def main():
     
     # filelist = []
     processes = []
-    tmp_folder = '.gen_state'
-    if os.path.exists(tmp_folder):
-        shutil.rmtree(tmp_folder)
-    os.makedirs(tmp_folder)
+    import tempfile
+    tmp_folder = tempfile.mkdtemp(prefix=".gen_state_")
     err_queue = Queue()
     for gpu_i in range(num_gpus):
         save_path_i = f'{tmp_folder}/{gpu_i}_part'
@@ -804,7 +804,7 @@ def main():
         print("回退到原始cat命令...")
         subprocess.run(f"cat {tmp_folder}/*_part > {script_args.save_path}", shell=True)
     finally:
-        shutil.rmtree(tmp_folder)
+        shutil.rmtree(tmp_folder, ignore_errors=True)
     
 
 

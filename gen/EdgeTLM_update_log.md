@@ -1,3 +1,22 @@
+## 2025-02-12 V100 单专家训练（阶段二）
+- 数据集：`sft_dataset_mutil_v1/v100_gen_best_multi/edge_sft_v100.jsonl`（231 条，含 `hw_emb` + `lat_base_star`，`lat_lora_star=None`）。
+- 训练命令：
+  ```
+  python train_edge_expert.py \
+    --base-model-path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/clm_gen_multi_v1 \
+    --tokenizer-path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/multi_hardware_tokenizer \
+    --dataset-jsonl /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/sft_dataset_mutil_v1/v100_gen_best_multi/edge_sft_v100.jsonl \
+    --output-dir /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_experts/v100/stage02_20250212_fullrun \
+    --num-epochs 3 \
+    --batch-size 4 \
+    --lambda-gain 0.0 \
+    --warmup-steps 200 \
+    --target-modules attn.c_attn,attn.c_proj,mlp.c_fc,mlp.c_proj
+  ```
+- 关键指标：`avg_loss=6.80 → final task_loss=5.09`，门控均值 `g_mean` 从 0.38 提升到 0.55，`gain_loss=0`（因暂未注入 `lat_lora_star`）。训练日志暂未持久化，后续补写 `train.log`。
+- 产物目录：`edge_experts/v100/stage02_20250212_fullrun/`（含 `adapter_model.safetensors`、`router.json`、`metrics.json` 等，`router.meta.train_samples=231`）。
+- 下一步：真机测得 LoRA 延迟并更新 JSONL 后，重新训练以开启 `lambda_gain>0`，同时在 `EdgeTLM_update_log.md` 持续记录阶段二→三进展。
+
 ## 统一改造计划（2025-XX-XX）
 - **建模层重构**：在 `modeling/experts/` 内新增 `GatedLoRAExpert`，并引入 `base_plus_experts.py`，实现 `BasePlusExperts` 容器，确保单 LoRA 专家 + 单行路由的前向形式。
 - **训练损失模块**：创建 `training/losses.py`，实现 `compute_task_loss`、`compute_gain_loss`、`entropy_reg`、`l2r_reg` 等函数，支持冷启动与退火。

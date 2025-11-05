@@ -177,6 +177,7 @@ def main() -> None:
     delta_module = PeftDeltaWrapper(lora_model)
 
     expert = GatedLoRAExpert(lora_module=delta_module, r_dim=len(dataset[0]["hw_emb"]))
+    expert.to(device)
     registry = ExpertRegistry()
     registry.register(cfg.adapter_name, expert)
     system = BasePlusExperts(frozen_base, registry)
@@ -205,8 +206,8 @@ def main() -> None:
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             hw_emb = batch["hw_emb"].to(device)
-            lat_base = torch.tensor(batch["lat_base"], dtype=torch.float32, device=device)
-            lat_lora = torch.tensor(batch["lat_lora"], dtype=torch.float32, device=device)
+            lat_base = batch["lat_base"].to(device=device, dtype=torch.float32)
+            lat_lora = batch["lat_lora"].to(device=device, dtype=torch.float32)
 
             with torch.no_grad():
                 base_outputs = frozen_base(input_ids=input_ids, attention_mask=attention_mask)
