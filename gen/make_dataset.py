@@ -14,7 +14,7 @@ from functools import partial
 import subprocess
 import shutil
 from tokenizer import train_tokenizer, test_model_max_length
-from make_dataset_utils import json_to_token, make_dataset, make_dataset_test
+from make_dataset_utils import json_to_token, make_dataset, make_dataset_test, filter_files_with_regex
 import re
 from enum import Enum
 from tvm.auto_scheduler.measure import MeasureInput
@@ -45,6 +45,10 @@ class ScriptArguments:
     keep_cnt: int = field(default=None, metadata={"help": ""})
     test_file_idx: int = field(default=None, metadata={"help": ""})
     schedule_file_path: str = field(default=None, metadata={"help": ""})
+    emit_hw_student: bool = field(default=False, metadata={"help": "Emit additional student text with hardware token placeholder"})
+    hw_token_placeholder: str = field(default="[MASK]", metadata={"help": "Token placeholder used to replace hardware text"})
+    hardware_embedding_path: str = field(default="Embedding/hardware_embeddings_v2.json", metadata={"help": "Path to hardware embedding json"})
+    file_filter: str = field(default=None, metadata={"help": "Optional regex to filter input files by basename"})
 
 
 def for_clm_or_mlm(for_type):
@@ -57,6 +61,12 @@ def for_clm_or_mlm(for_type):
         return "mlm"
     else:
         assert(False)
+
+
+def load_hardware_embeddings(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        entries = json.load(f)
+    return {entry["hardware_name"]: entry["vector"] for entry in entries}
 
 
 def for_gen(lines):
@@ -230,7 +240,7 @@ def for_gen_eval_sketch(lines, keep_cnt, for_type):
     return data_list
 
 
-def input_to_tokens(task, states, input):
+def input_to_tokens(task, states, input, hw_token_placeholder: str = None):
     compute_dag = task.compute_dag.print_min()
     json_line_i = json.loads(input.to_json())
     workload_key = json_line_i[0][0]
@@ -246,24 +256,40 @@ def input_to_tokens(task, states, input):
                 for i in range(len(sp_list)):
                     sp_list[i] = 1
         json_line_i[1][1] = steps
+        json_line_copy = copy.deepcopy(json_line_i)
+        if hw_token_placeholder:
+            try:
+                json_line_copy[0][1] = hw_token_placeholder
+            except Exception:
+                pass
         data = {}
-        data["text"] = [compute_dag, copy.deepcopy(json_line_i)]
+        data["text"] = [compute_dag, json_line_copy]
         data_list.append(data)
 
     return [item["text"] for item in json_to_token(data_list)]
 
 
-def process_file(args, tmp_folder, for_type, keep_cnt):
+def process_file(args, tmp_folder, for_type, keep_cnt, hw_token_placeholder=None, hardware_embeddings=None, emit_hw_student=False):
     file_i, file = args
     print(file_i, end="    \r", flush=True)
     with open(file, "r") as f:
         lines = f.read().strip().split("\n")
     if for_type == FOR_GEN_TOKENIZER or for_type == FOR_GEN or for_type == FOR_LATENCY:
         data_list = for_gen(lines)
-        data_list = json_to_token(data_list)
+        data_list = json_to_token(
+            data_list,
+            hw_token_placeholder=hw_token_placeholder,
+            hardware_embeddings=hardware_embeddings,
+            emit_hw_student=emit_hw_student,
+        )
     elif for_type == FOR_GEN_BEST or for_type == FOR_GEN_BEST_ALL:
         data_list = for_gen_best(lines)
-        data_list = json_to_token(data_list)
+        data_list = json_to_token(
+            data_list,
+            hw_token_placeholder=hw_token_placeholder,
+            hardware_embeddings=hardware_embeddings,
+            emit_hw_student=emit_hw_student,
+        )
     elif for_type == FOR_GEN_EVAL_SKETCH or for_type == FOR_GEN_TRAIN_SKETCH or for_type == FOR_GEN_EVALTUNING_SKETCH or for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
         data_list = for_gen_eval_sketch(lines, keep_cnt, for_type)
     else:
@@ -275,7 +301,7 @@ def process_file(args, tmp_folder, for_type, keep_cnt):
             f.write("\n")
 
 
-def token_files_and_merge(for_type, files, save_path, keep_cnt=None):
+def token_files_and_merge(for_type, files, save_path, keep_cnt=None, hw_token_placeholder=None, hardware_embeddings=None, emit_hw_student=False):
     os.makedirs(save_path, exist_ok=True)
     filename = f"{save_path}/0_merge.json"
     tmp_folder = f"{save_path}/0_tmp"
@@ -283,7 +309,18 @@ def token_files_and_merge(for_type, files, save_path, keep_cnt=None):
         shutil.rmtree(tmp_folder)
     os.makedirs(tmp_folder)
     with Pool(os.cpu_count()) as pool:
-        pool.map(partial(process_file, tmp_folder=tmp_folder, for_type=for_type, keep_cnt=keep_cnt), enumerate(files))
+        pool.map(
+            partial(
+                process_file,
+                tmp_folder=tmp_folder,
+                for_type=for_type,
+                keep_cnt=keep_cnt,
+                hw_token_placeholder=hw_token_placeholder,
+                hardware_embeddings=hardware_embeddings,
+                emit_hw_student=emit_hw_student,
+            ),
+            enumerate(files),
+        )
     print()
     subprocess.run(f"cat {tmp_folder}/*_part > {filename}", shell=True)
     shutil.rmtree(tmp_folder)
@@ -327,18 +364,32 @@ def main():
     
     tasks = load_and_register_tasks()
 
+    hardware_embeddings = None
+    if script_args.emit_hw_student:
+        hardware_embeddings = load_hardware_embeddings(script_args.hardware_embedding_path)
+    hw_token_placeholder = script_args.hw_token_placeholder if script_args.emit_hw_student else None
+
     if script_args.for_type == FOR_GEN_TOKENIZER:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
+        files = filter_files_with_regex(files, script_args.file_filter)
         files.sort()
         print("Dataset file cnt:", len(files))
         if script_args.file_cnt:
             set_seed(0)
             files = random.sample(files, script_args.file_cnt)
             print("Sampled file cnt:", len(files))
-        filename = token_files_and_merge(script_args.for_type, files, script_args.tokenizer_path)
+        filename = token_files_and_merge(
+            script_args.for_type,
+            files,
+            script_args.tokenizer_path,
+            hw_token_placeholder=hw_token_placeholder,
+            hardware_embeddings=hardware_embeddings,
+            emit_hw_student=script_args.emit_hw_student,
+        )
         train_tokenizer([filename], script_args.tokenizer_path, test_length=True)
     elif script_args.for_type == FOR_GEN:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
+        files = filter_files_with_regex(files, script_args.file_filter)
         files.sort()
         print("Dataset file cnt:", len(files))
         hold_out_files = get_hold_out_five_files(script_args.target)
@@ -351,7 +402,14 @@ def main():
             set_seed(0)
             files = random.sample(files, script_args.file_cnt)
             print("Sampled file cnt:", len(files))
-        filename = token_files_and_merge(script_args.for_type, files, script_args.save_path)
+        filename = token_files_and_merge(
+            script_args.for_type,
+            files,
+            script_args.save_path,
+            hw_token_placeholder=hw_token_placeholder,
+            hardware_embeddings=hardware_embeddings,
+            emit_hw_student=script_args.emit_hw_student,
+        )
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type))
     elif script_args.for_type == FOR_LATENCY:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
@@ -371,6 +429,7 @@ def main():
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type))
     elif script_args.for_type == FOR_GEN_BEST:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
+        files = filter_files_with_regex(files, script_args.file_filter)
         files.sort()
         print("Dataset file cnt:", len(files))
         
@@ -389,16 +448,32 @@ def main():
             set_seed(0)
             files = random.sample(files, script_args.file_cnt)
             print("Sampled file cnt:", len(files))
-        filename = token_files_and_merge(script_args.for_type, files, script_args.save_path)
+        filename = token_files_and_merge(
+            script_args.for_type,
+            files,
+            script_args.save_path,
+            hw_token_placeholder=hw_token_placeholder,
+            hardware_embeddings=hardware_embeddings,
+            emit_hw_student=script_args.emit_hw_student,
+        )
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type), valid_percentage=0)
     elif script_args.for_type == FOR_GEN_BEST_ALL:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
+        files = filter_files_with_regex(files, script_args.file_filter)
         files.sort()
         print("Dataset file cnt:", len(files))
-        filename = token_files_and_merge(script_args.for_type, files, script_args.save_path)
+        filename = token_files_and_merge(
+            script_args.for_type,
+            files,
+            script_args.save_path,
+            hw_token_placeholder=hw_token_placeholder,
+            hardware_embeddings=hardware_embeddings,
+            emit_hw_student=script_args.emit_hw_student,
+        )
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type), valid_percentage=0)
     elif script_args.for_type == FOR_GEN_EVAL_SKETCH or script_args.for_type == FOR_GEN_EVALTUNING_SKETCH or script_args.for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
+        files = filter_files_with_regex(files, script_args.file_filter)
         files.sort()
         print("Dataset file cnt:", len(files))
         if script_args.for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
@@ -418,9 +493,18 @@ def main():
             from task_sheduler import find_potential_files
             files = find_potential_files(files)
             print("Find potential file cnt:", len(files))
-        filename = token_files_and_merge(script_args.for_type, files, script_args.save_path, keep_cnt=script_args.keep_cnt)
+        filename = token_files_and_merge(
+            script_args.for_type,
+            files,
+            script_args.save_path,
+            keep_cnt=script_args.keep_cnt,
+            hw_token_placeholder=hw_token_placeholder,
+            hardware_embeddings=hardware_embeddings,
+            emit_hw_student=script_args.emit_hw_student,
+        )
     elif script_args.for_type == FOR_GEN_TRAIN_SKETCH:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
+        files = filter_files_with_regex(files, script_args.file_filter)
         files.sort()
         print("Dataset file cnt:", len(files))
         hold_out_files = get_hold_out_five_files(script_args.target)
@@ -444,7 +528,15 @@ def main():
         #     from task_sheduler import find_potential_files
         #     files = find_potential_files(files)
         #     print("Find potential file cnt:", len(files))
-        filename = token_files_and_merge(script_args.for_type, files, script_args.save_path, keep_cnt=script_args.keep_cnt)
+        filename = token_files_and_merge(
+            script_args.for_type,
+            files,
+            script_args.save_path,
+            keep_cnt=script_args.keep_cnt,
+            hw_token_placeholder=hw_token_placeholder,
+            hardware_embeddings=hardware_embeddings,
+            emit_hw_student=script_args.emit_hw_student,
+        )
     else:
         assert(False)
 

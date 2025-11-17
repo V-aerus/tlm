@@ -590,3 +590,152 @@ python train_edge_expert.py \
 推理阶段，我们用
  排序并取 Top-K，即选择“最值得开启”的若干 LoRA，按其强度做加权合成。
 这将“该不该开”与“开多大”统一在一个可微的连续门控里，既继承了 MoE 的选择性，又避免了硬开关的不稳定。
+
+---
+
+**硬件 OOV 与插值泛化方案（草案）**
+
+- 背景问题（现状与痛点）
+  - TLM 将“子图 ComputeDAG 文本头 + 目标硬件字符串（target）+ 调度步骤（张量语言）”拼接后做分词训练。遇到新硬件（例如未出现过的 CUDA 目标或 CPU 型号）时，target 字符串可能 OOV，被切成无意义的子词，导致 TLM-Base 在输入端就“读不懂硬件语义”。
+  - 数据稀疏：当前仅有少数硬件（如 v100/4090/xavier/xeon）的样本；希望在不重训 Base 的前提下实现对新硬件的 Zero-shot/Few-shot 泛化。
+  - 约束：模型输出仍必须是“张量语言”，不能改变范式或要求额外的自然语言解释。
+
+- 目标（不改 Base，跨硬件泛化）
+  - 冻结 TLM-Base，不改动其词表与 Transformer 参数。
+  - 通过“连续硬件向量 → 可插值的嵌入注入”绕开 target 文本 OOV，使新硬件在 TLM 的输入空间中拥有稳定、可插值的语义表示。
+
+- 两条协作思路（Teacher + Student）
+  - 思路 A：桶化 Bucketing（Teacher 与兜底）
+    - 把冗长且易变的 target 文本压缩成少量稳定“桶”词（例：<arch:Ampere> <warp:32> <bw:H>），用于：
+      1) Teacher 路径的知识蒸馏监督（无 OOV、语义稳定）；
+      2) 推理兜底：当新硬件明显落在已知硬件凸包之外时回退使用。
+  - 思路 B：硬件 Embedding 注入 HW Embedding Injection（Student 与最终方案）
+    - 在输入句子中，用特殊占位符 <HW> 替换原来的 target 文本；不依赖词表语义。
+    - 用外部硬件向量 h 通过可插值的投影函数生成 e(h)，并将 e(h) 注入到 <HW> 的位置（inputs_embeds 覆盖）。
+    - 投影函数采用 ProtoMix（原型混合）结构以保证“先验连续性”：
+      - 设已知硬件原型向量 {h_k} 与可训练的“语义原型嵌入” {z_k}；
+      - 相似度 α_k(h) = softmax(cos(h, h_k)/τ)；
+      - e(h) = Σ_k α_k(h) · z_k（凸组合，天然可插值）。
+
+- 训练策略（冻结 Base，蒸馏对齐 + 可选 CE）
+  - 样本成对构造：
+    - Teacher 文本：保持原 target 文本（或桶化后的稳定文本）；
+    - Student 文本：相同句子但将 target 文本替换为单个 <HW>；同时提供硬件向量 h；
+    - 均保留“ComputeDAG 文本头 + 步骤（张量语言）”的一致上下文。
+  - 前向：
+    - Teacher：冻结 Base，得到 logits_T（不反传）。
+    - Student：冻结 Base，仅在 <HW> 位置注入 e(h)（由 ProtoMix 产生），得到 logits_S。
+  - 损失：
+    - 主：KD = KL(P_Teacher || P_Student)；
+    - 辅：CE 到张量语言标签；正则：原型 z_k 的 L2、α 的熵正则、可选温度 τ 学习；
+    - 插值蒸馏（可选）：对 h_λ = λ h_i + (1-λ) h_j，约束 P_S(h_λ) ≈ λ P_T(h_i) + (1-λ) P_T(h_j)，提升凸包内的平滑插值能力。
+
+- 推理改造（与现有 gen_state 兼容）
+  - 外部文件仍使用“记录版 JSON（i/r）”以便 TVM 复现与测量。
+  - 在 gen_state 中，将“记录 → 句子前缀”的转换改为 Student 形式：
+    - 删除/忽略原 target 文本，替换为单个 <HW>，构造 input_ids；
+    - 由目标硬件向量 h 经过 ProtoMix 得到 e(h)，再用 inputs_embeds 覆盖 <HW> 位置；
+    - 其余 token 使用 Base 的词嵌入；保持 attention_mask/eos 等参数一致；
+    - 调用 model.generate(...) 生成后续步骤，最终仍写回记录版 JSON（便于测量与后处理）。
+  - 兜底：当 α 的分布显示“凸包外”（如 α_max 过低/熵过高）时，回退到桶化 Teacher 文本推理或触发少量测量的 Few-shot 校准。
+
+- 数据与实现落点（计划）
+  - 数据集构造：
+    - 保持现有 0_merge.json（Teacher 文本）不变；
+    - 新增 Student 文本导出（同一条样本替换 target 为 <HW>），同时保存 hw_emb（来源于 Embedding/hardware_embeddings_v2.json 或 prepare_edge_dataset.py 导出的 JSONL）。
+  - 代码路径（拟）：
+    - gen/make_dataset.py 与 gen/make_dataset_utils.py：增加 Student 文本导出/加载分支；
+    - gen/gen_state.py：增加 --hw_injection 与 --edge_embedding_path；在 gen_func 中走 inputs_embeds 路径注入 e(h)；
+    - 新增 modeling/hw_injection.py：实现 ProtoMix（{z_k} 可训练、α_k(h) 由余弦相似/小线性 + softmax 产生，可选温度 τ）。
+  - 兼容性：不改 Base 结构与输出范式；外部产物仍为记录版 JSON；与 Edge 专家与 LoRA 门控互不冲突。
+
+- 验证与度量（建议）
+  - 一致性（同硬件）：Teacher vs Student 的 KL 均值/分位，端到端生成/测量指标差异；
+  - 插值实验：对 h_λ 的 KL/延迟曲线是否平滑；logits 的 Lipschitz 估计；
+  - OOT 仿真：将某已知硬件当作“新硬件”隐藏 Teacher 文本，纯注入 Student 路径评估，再做 Few-shot 校准曲线；
+  - 真新硬件：先 Zero-shot，凸包外检测后启用兜底/少量样本。
+
+- 风险与边界
+  - 新模型/新 TVM 版本引入新的 ComputeDAG 模板（新哈希）不影响流程：记录恢复依赖 TVM workload 注册表而非词表；
+  - 极端外推硬件可能需要 Few-shot 校准；
+  - inputs_embeds 路径需与 generate 的缓存/掩码参数仔细对齐（HF 支持，需在实现中单测）。
+
+- 小结
+  - 该方案在不重训 Base 的前提下，构建一条“连续、可插值”的硬件语义注入通路，解决 target 文本 OOV，引入 Teacher 蒸馏保证语义等价，并保留现有张量语言与 TVM 记录产物，适合作为 EdgeTLM 的跨硬件泛化基础能力。
+
+---
+
+**TLM 硬件泛化（OOV）解决方案：HwToken 注入（版本提案）**
+
+- 项目目标与约束
+  - 目标：当出现新硬件（其 target 文本 OOV）时，TLM‑Base 仍能理解“硬件语义”并生成正确的“张量语言”。
+  - 约束：
+    - 冻结 TLM‑Base，不能重训；
+    - 兼容现有硬件向量资产 h（Embedding/hardware_embeddings_v2.json 等）；
+    - 不改变输出范式（仍为张量语言）。
+
+- 灵感来源（输入层注入 + 可训练对齐器）
+  - CAN_LLM（ICLR'25）输入层拼接外部模态（GraphToken），与“冻结 Base”兼容。
+  - MPnP（MobiCom'25）提出可训练对齐器（Aligner/投影器）将外部模态对齐到 LLM 可消费空间；其“深层注入（最后 N 层 KV 注入）”与本项目不兼容，暂不采用。
+
+- 选型与总体思路
+  - 注入位置：采用 CAN_LLM 的输入层注入（Prompt‑level），避免改动 Transformer 结构。
+  - 绕开词表：不再喂入易 OOV 的硬件 target 文本，改为在句子中放置一个 <HW> 占位符（或沿用已有特殊标记如 [MASK]）。
+  - 动态嵌入：<HW> 的向量不从 Base 词表取，而由“对齐器（Aligner）”基于外部硬件向量 h 动态生成，随后以 inputs_embeds 形式注入。
+  - Aligner 方案：
+    - ProtoMix（优先）：e(h)=Σ α_k(h)·z_k，α_k(h)=softmax(cos(h,h_k)/τ)。其中 h_k 为已知硬件原型，z_k 为可训练“语义原型嵌入”（维度=Base 词嵌入维度）。凸组合天然可插值，适合样本稀疏；可选温度/正则。
+    - 备选/增强：线性投影 W·h 或 ProtoMix + 小残差（受正则约束），以防表达力不足。
+
+- 训练策略（首选纯 CE，必要时再引入 KD）
+  - 冻结 Base，仅训练对齐器（z_k、可选温度/小线性）。
+  - 输入：
+    - Student 文本：将原句中的硬件 target 文本替换为 <HW>，其余保持“ComputeDAG 文本头 + 步骤（张量语言）”不变；同时提供硬件向量 h。
+  - 前向：
+    - 用 Base.get_input_embeddings() 将 input_ids → embeds；定位 <HW> 位置，并以 e(h)=Aligner(h) 覆盖对应向量；作为 inputs_embeds 喂入 Base；
+  - 损失：CrossEntropy 到张量语言标签（与现有 CLM/SFT 一致）；梯度仅更新对齐器参数。
+  - 计划 B（可选）：若纯 CE 不稳，则引入 KD：Teacher（原/桶化 target 文本）与 Student（<HW> 注入）做 KL 蒸馏；Teacher 亦可用于凸包外兜底推理。
+
+- 推理路径（与 gen_state 兼容）
+  - 外部文件仍为“记录版 JSON（i/r）”，便于 TVM 复现/测量。
+  - 在 gen_state 中的“记录 → 句子前缀”转换改为 Student 形态：
+    - 把 target 文本位置替换为 <HW>；
+    - 由目标硬件向量 h 经过对齐器得到 e(h)，以 inputs_embeds 注入；
+    - 其余 token 使用 Base 的嵌入；保持 attention_mask/eos 参数一致；
+    - 调用 model.generate(...) 生成后续步骤，最终仍写回记录版 JSON。
+
+- 验证与风险管理
+  - LOHO（留一硬件）：3 训 1 验，评估 Zero‑shot 与 Few‑shot；
+  - 插值扫描：在两硬件间做 h_λ=λh1+(1−λ)h2，检查 e(h_λ) 的余弦平滑与模型 Loss/PPL 的平滑；
+  - 增广与正则：对 h 加微噪声（邻域抖动）、对 z_k/LN/温度做正则，防过拟合 4 个硬件；
+  - 兜底：α_max 过低/熵高判定“凸包外”，回退到桶化 Teacher 或触发少量测量校准。
+
+- 实现落点（最小改动）
+  - 数据：在现有 0_merge.json 基础上导出 Student 文本（target→<HW>）与 hw_emb；SFT 集可放入 edge_experts_sft_collections/<hw>/iterXX。
+  - 代码：
+    - 新增 modeling/hw_injection.py：ProtoMix 对齐器（{h_k},{z_k}, α_k(h), 温度 τ、可选 LN/正则）。
+    - 训练脚本：train_hw_injection.py（冻结 Base，inputs_embeds 覆盖 <HW> 向量，纯 CE 训练）。
+    - 推理改造：gen/gen_state.py 增加 --hw_injection 与 --edge_embedding_path，gen_func 中以 inputs_embeds 注入 e(h)。
+  - 兼容性：不改 Base 结构、不改外部产物形态（记录版 JSON），与 Edge 专家/LoRA 门控独立。
+• 本次改动
+
+  - make_dataset_utils.py / make_dataset.py：新增
+  --emit_hw_student、--hw_token_placeholder、--hardware_embedding_path，在生成 0_merge.json 时可额外输出
+  text_student、hw_emb 等字段；并在 json_to_token/input_to_tokens 里支持将 target 文本替换为占位符，方便后续 HwToken
+  训练与推理。
+  - modeling/hw_injection.py / modeling/__init__.py：新增 ProtoMix 对齐器实现（包含构建原型矩阵的辅助函数），统一导出
+  供训练与推理侧加载。
+  - train_hw_injection.py：新建训练脚本，冻结 TLM-Base，仅训练 ProtoMix；直接复用 CLM CE Loss，支持自定义原型列表、占
+  位符 Token、Grad Accumulate 等，训练完成后输出 hw_aligner.pt。
+  - gen/gen_state.py：加入 --hw_injection/--hw_aligner_path/--hw_token 等开关；在 worker 内加载 ProtoMix、注入 HwToken
+  占位符并用 inputs_embeds 前向，从而在推理时绕开硬件 OOV。新增 prepare_hw_injection_context、hw_injection_cfg 在多进
+  程间传递，确保模型生成流程与原有 Edge/LoRA 逻辑兼容。
+  - 其他：对 train_hw_injection.py 的 checkpoint 新增 embed_dim，方便推理侧还原；在 make_dataset_utils 增加硬件识别工
+  具函数并导出 hw_emb。
+
+  后续可选操作
+
+  1. 运行 make_dataset.py ... --emit_hw_student --hw_token_placeholder [MASK] 重新导出带 text_student/hw_emb 的
+  0_merge.json。
+  2. 用 train_hw_injection.py 训练 ProtoMix，对输出的 hw_aligner.pt 执行 LOHO/插值验证。
+  3. 推理时在 gen_state.py 增加 --hw_injection --hw_aligner_path ... --hw_token [MASK]，即可启用 HwToken 注入。如需兜
+  底或 Few-shot，可继续按计划扩展。

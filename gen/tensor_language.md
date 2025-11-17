@@ -1,4 +1,54 @@
 "[\"3ed6b8b696d74a428d188b1a05553246\", [1, 128, 3072], [1, 3072, 768], [1, 128, 768]]",
+
+我们在本项目中将“子图”标准化为：可调度子图实例 = 计算图模板（ComputeDAG 模板/结构哈希）+ 具体形状（shapes）。它在TVM/AutoScheduler 中对应唯一的 workload_key。
+  - “调度任务”（SearchTask）= 子图实例 + 目标后端（target.kind）(+ 硬件参数、权重等运行上下文)。它是“在哪个后端上对这
+    个子图实例做调度搜索”的最小单位。
+  - dump_network_info 产生的 .task.pkl 是“某个网络在该 target 下的子图实例集合（SearchTask 列表）”，而不是一个单独子
+    图；汇总去重后的 all_tasks.pkl 则是“全量子图实例集合”。
+
+  层次化定义
+
+  - Relay 子图（图层面）
+      - 含义：模型在 Relay 层经算子融合后的一个可调度块（例如 conv2d+bn+relu）。
+      - 产物：对应 .relay.pkl，见 README.md:1、gen/dump_network_info.py:1。
+  - ComputeDAG 模板（TE/算子层面）
+      - 含义：该子图在 TOPI/TE 下的计算定义及依赖骨架（不含具体尺寸）。
+      - 标识：结构哈希（例如 00a059…），可认为是“模板指纹”。
+  - 子图实例（本项目“子图”的标准定义）
+      - 含义：ComputeDAG 模板 + 具体形状（输入/权重/偏置/输出等的尺寸）。
+      - 标识：唯一 workload_key（JSON 字符串）= ["<结构哈希>", <shape_1>, <shape_2>, ...]，例如 ["00a059…", [1,1024],
+        [1000,1024], [1,1000], [1,1000]]，见 gen/tensor_language.md:1、gen/make_dataset.py:102。
+  - 调度任务（SearchTask）
+      - 含义：在某个后端（target.kind）上对“子图实例”进行调度搜索的任务单元。
+      - 标识：通常以 (workload_key, str(target.kind)) 唯一；携带硬件参数（如共享内存、warp 大小）与权重（用于调度器打
+        分/优先级）。
+      - 产物来源：auto_scheduler.extract_tasks，保存在 .task.pkl 与最终汇总的 all_tasks.pkl，见 gen/
+        dump_network_info.py:1、gen/common.py:56。
+
+  文件语义对照
+
+  - …/network_info/v100/((bert_base,[1,64]),cuda).task.pkl
+      - 含义：网络 bert_base(batch=1, seq=64) 在 cuda 后端的“调度任务集合”，即一组 SearchTask（每个 SearchTask 对应一
+        个“子图实例”）。
+      - 是否对应多个“哈希+形状”：是。一个 .task.pkl 中包含很多 SearchTask，自然包含很多不同的 workload_key（即“结构哈
+        希+形状”组合）。
+  - …/network_info/v100/all_tasks.pkl
+      - 含义：汇总并去重后的“全量子图实例（SearchTask）集合”，用于后续 dump programs。你本机 cuda 下为 2374 项，4090、
+        V100 一致，见 gen/dump_network_info.py:1 的去重逻辑与我方实测。
+  - …/to_measure_programs/v100/([哈希,形状…],cuda).json
+      - 含义：对应某个“调度任务”的初始候选记录集合（每行一个 record），由 AutoScheduler 的 SketchPolicy 抽样得到，不是
+        穷举全空间，见 gen/dump_programs.py:1。
+
+  命名约定（建议在项目内统一）
+
+  - 子图模板（或 DAG 模板）= 结构哈希（不含形状）
+  - 子图（标准用语）= 子图实例 = DAG 模板 + 形状 = workload_key
+  - 调度任务（SearchTask）= 子图 + target.kind（+ 硬件参数/权重）
+  - .task.pkl = 某网络在该后端的“调度任务集合”
+  - all_tasks.pkl = 全网络汇总去重后的“调度任务集合”（即“子图集合”）
+  - to_measure_programs/*.json = 每个“调度任务”的“初始候选记录集合”（后续再由 TLM 扩展生成）
+
+
 - 在论文和 TLM 的上下文中，工作负载是指一个具体的深度学习任务，通常由模型及其输入配置（例如输入形状或批量大小）共同定义。工作负载可以看作是模型的一个实例化应用场景。例如： 
   - 模型：bert_base。
   - 工作负载：bert_base 模型在输入 batch_size=1, seq_length=128 时的计算任务。

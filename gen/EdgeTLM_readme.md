@@ -1,5 +1,8 @@
 # EdgeTLM 快速手册（2025-02 更新）
+
 -codex resume 019a48d6-27ec-7611-8c72-01163e73d45e
+
+
 本文档汇总当前 EdgeTLM 管线的关键命令与目录规划，覆盖 V100 与 RTX4090 两个硬件场景。路径均以仓库根目录 `/home/hehangshuai/workspace/tlm/gen` 与数据根 `/home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data` 为基准，请按照实际需求调整。
 
 ## 目录约定
@@ -145,3 +148,27 @@ python prepare_edge_dataset.py \
 4. 在开启增益约束前确保 `lat_lora_star` 数据完整，避免 `gain_loss` 恒为零。
 
 如需扩展到其他硬件，请参考 README 中的管线，先准备 `to_measure_programs/<hw>`、`network_info/<hw>` 等基础数据，再按本手册流程推进。***
+
+---
+
+## 附：多硬件记录语料的分批处理与 HwToken 导出提示
+
+- 记录版数据位置与形态
+  - `dataset/to_measure_programs/multi_hardware/`：按硬件前缀命名的 TVM 记录版 JSON（含 `"i"/"r"`），可用于 `make_dataset --for_gen` 重建 ComputeDAG + 张量句子。
+  - `dataset/to_measure_programs/multi_hardware_simple/all_programs.txt`：已扁平化的纯文本总集，适合 tokenizer 训练，无法再恢复 DAG。
+
+- 分批处理建议（避免跨后端冲突）
+  - `make_dataset --for_gen` 一次只能注册一个后端的 `all_tasks.pkl`，不能同时处理 CUDA + LLVM 记录。
+  - 建议用 `--file_filter` 按文件名前缀分两次跑：
+    - CUDA 组：`--target="cuda ..." --file_filter "^(v100_|4090_|xavier_)"`
+    - LLVM/CPU 组：`--target="llvm ..." --file_filter "^(xeon_|i7_|llvm_)"`
+  - 分别生成两个 `0_merge.json`，再用 `cat` 合并为统一语料。
+
+- HwToken（Student 文本）导出
+  - 加 `--emit_hw_student True --hw_token_placeholder "[MASK]" --hardware_embedding_path=gen/Embedding/hardware_embeddings_v2.json`，可在 `0_merge.json` 里额外输出：
+    - `text_student`（target→占位符）、`hw_emb`/`hw_id`/`hw_name`，用于对齐器/注入训练及推理。
+  - 适用于记录版 JSON 输入；若源数据已是文本语料（如 `pretrain_data_multi_v1/0_merge.json`），无需再跑 `for_gen`。
+
+- 记忆点
+  - CUDA 设备间任务集一致，可任选 CUDA target 处理 CUDA 记录；CPU 记录需用 LLVM target 注册对应 `all_tasks.pkl`。
+  - `target=multi` 的路径推断仅适配 `.../measure_records/<hw>`，不适用于 `to_measure_programs/multi_hardware`，请按上述分批方式处理。

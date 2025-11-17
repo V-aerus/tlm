@@ -46,6 +46,7 @@ from modeling import (
     FrozenBaseWrapper,
     GatedLoRAExpert,
     PeftDeltaWrapper,
+    ProtoMixAligner,
 )
 
 
@@ -67,16 +68,20 @@ class ScriptArguments:
     
     # 硬件路由参数
     target_hardware: str = field(default=None, metadata={"help": "Target hardware type for MT-MoSLoRA (e.g., v100, xavier, i7)"})
+    hw_injection: bool = field(default=False, metadata={"help": "Enable HwToken injection"})
+    hw_aligner_path: str = field(default=None, metadata={"help": "Path to ProtoMix aligner checkpoint"})
+    hw_token: str = field(default="[MASK]", metadata={"help": "Token placeholder used for hardware injection"})
 
     # device: str = field(default="cuda:0", metadata={"help": ""})
     allow_repeat: bool = field(default=True, metadata={"help": ""})
     is_build: bool = field(default=False, metadata={"help": ""})
 
 
-def gen_func(task, states, input, tokenizer, model, device, gen_kwargs):
+def gen_func(task, states, input, tokenizer, model, device, gen_kwargs, hw_injection_ctx=None):
     if len(states) == 0:
         return []
-    tokens = input_to_tokens(task, states, input)
+    hw_placeholder = hw_injection_ctx["placeholder"] if hw_injection_ctx else None
+    tokens = input_to_tokens(task, states, input, hw_token_placeholder=hw_placeholder)
     tokenizer.padding_side = "left"
     try:
         batch = tokenizer(tokens, padding=True, max_length=None)
@@ -90,15 +95,27 @@ def gen_func(task, states, input, tokenizer, model, device, gen_kwargs):
 
     response_list = []
     with torch.no_grad():
+        embed_layer = model.get_input_embeddings()
         for start in range(0, len(input_ids_all), batch_size):
-            input_ids = input_ids_all[start : start + batch_size]
-            attention_mask = attention_mask_all[start : start + batch_size]
+            input_ids = torch.tensor(input_ids_all[start : start + batch_size], dtype=torch.long, device=device)
+            attention_mask = torch.tensor(attention_mask_all[start : start + batch_size], dtype=torch.long, device=device)
 
-            input_ids = torch.tensor(input_ids, dtype=torch.long).to(device)[:, :-1]
-            attention_mask = torch.tensor(attention_mask, dtype=torch.long).to(device)[:, :-1]
+            input_ids = input_ids[:, :-1]
+            attention_mask = attention_mask[:, :-1]
             gen_kwargs['max_new_tokens'] = min(gen_kwargs['max_new_tokens'], tokenizer.model_max_length - input_ids.shape[-1])
 
-            response = model.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
+            if hw_injection_ctx:
+                embeds = embed_layer(input_ids)
+                hw_mask = (input_ids == hw_injection_ctx["hw_token_id"])  # (B, L)
+                if not torch.all(hw_mask.any(dim=1)):
+                    raise ValueError("HwToken injection requires placeholder token in every prompt")
+                batch_hw = hw_injection_ctx["hw_vec"].unsqueeze(0).expand(input_ids.size(0), -1)
+                hw_embed = hw_injection_ctx["aligner"](batch_hw)
+                embeds = torch.where(hw_mask.unsqueeze(-1), hw_embed.unsqueeze(1), embeds)
+                response = model.generate(inputs_embeds=embeds, attention_mask=attention_mask, **gen_kwargs)
+            else:
+                response = model.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
+
             response = response[:, input_ids.shape[-1]:]
             response_list.extend(response.tolist())
     return [tokenizer.batch_decode(item) for item in response_list]
@@ -158,6 +175,33 @@ def resolve_hw_embedding(hardware_id: str, embeddings: Dict[str, List[float]]) -
         if hardware_id in name:
             return name, vector
     raise KeyError(f"No embedding found for hardware id '{hardware_id}'")
+
+
+def prepare_hw_injection_context(cfg, tokenizer, model, device):
+    ckpt = torch.load(cfg["aligner_path"], map_location=device)
+    proto = torch.tensor(ckpt["prototype_keys"], dtype=torch.float32, device=device)
+    embed_layer = model.get_input_embeddings()
+    embed_dim = ckpt.get("embed_dim", embed_layer.embedding_dim)
+    cfg_meta = ckpt.get("config", {})
+    temperature = cfg_meta.get("temperature", ckpt.get("temperature", 1.0))
+    trainable_temp = cfg_meta.get("trainable_temperature", False)
+    aligner = ProtoMixAligner(proto, embed_dim=embed_dim, temperature=temperature, trainable_temperature=trainable_temp)
+    aligner.load_state_dict(ckpt["state_dict"])
+    aligner.to(device)
+    aligner.eval()
+
+    hw_token = cfg.get("hw_token", ckpt.get("hw_token", "[MASK]"))
+    hw_token_id = tokenizer.convert_tokens_to_ids(hw_token)
+    if hw_token_id == tokenizer.unk_token_id:
+        raise ValueError(f"Tokenizer does not recognize hardware token '{hw_token}'")
+
+    hw_vec = torch.tensor(cfg["hw_vec"], dtype=torch.float32, device=device)
+    return {
+        "aligner": aligner,
+        "hw_vec": hw_vec,
+        "hw_token_id": hw_token_id,
+        "placeholder": hw_token,
+    }
 
 
 def load_model_for_inference(args: ScriptArguments) -> tuple:
@@ -562,7 +606,7 @@ def merge_json_files_safely(tmp_folder, save_path):
         raise
 
 
-def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_path, multi_adapter_dir, target_hardware, original_target, device, allow_repeat, keep_cnt, is_build, worker_id, num_workers):
+def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_path, multi_adapter_dir, target_hardware, original_target, device, allow_repeat, keep_cnt, is_build, worker_id, num_workers, hw_injection_cfg=None):
     try:
         # <<< 新增的TVM初始化代码 >>>
         print(f"Initializing TVM environment in worker for target: {original_target}")
@@ -580,6 +624,9 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
             adapter_path=adapter_path,
             multi_adapter_dir=multi_adapter_dir,
             target_hardware=target_hardware,
+            hw_injection=bool(hw_injection_cfg),
+            hw_aligner_path=hw_injection_cfg["aligner_path"] if hw_injection_cfg else None,
+            hw_token=hw_injection_cfg["hw_token"] if hw_injection_cfg else "[MASK]",
             allow_repeat=allow_repeat,
             is_build=is_build
         )
@@ -596,6 +643,9 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
         print(f"Moving model to device: {device}")
         model = model.to(device)
         model.eval()
+        hw_injection_ctx = None
+        if hw_injection_cfg:
+            hw_injection_ctx = prepare_hw_injection_context(hw_injection_cfg, tokenizer, model, device)
         builder = auto_scheduler.measure.LocalBuilder(timeout=30)
         if os.path.exists(save_path_i):
             # tag = input(script_args.save_path + ' exist, delete it? [n]')
@@ -642,7 +692,7 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
                 def gen_func_inner(task, states, max_new_tokens):
                     max_new_tokens = max(max_new_tokens, 1)
                     gen_kwargs["max_new_tokens"] = max_new_tokens
-                    return gen_func(task, states, inputs[0], tokenizer, model, device, gen_kwargs)
+                    return gen_func(task, states, inputs[0], tokenizer, model, device, gen_kwargs, hw_injection_ctx=hw_injection_ctx)
 
                 policy = auto_scheduler.SketchPolicy(inputs[0].task)
                 measure_inputs = []
@@ -750,6 +800,20 @@ def main():
         "eos_token_id": None   # 将在worker进程中设置
     }
 
+    hw_injection_cfg = None
+    if script_args.hw_injection:
+        if not script_args.hw_aligner_path:
+            raise ValueError("--hw_injection requires --hw_aligner_path")
+        embeddings = load_hardware_embeddings(script_args.edge_embedding_path)
+        hw_id = (script_args.target_hardware or extract_hardware_id_from_target(script_args.target)).lower()
+        hw_name, hw_vec = resolve_hw_embedding(hw_id, embeddings)
+        hw_injection_cfg = {
+            "aligner_path": script_args.hw_aligner_path,
+            "hw_vec": hw_vec,
+            "hw_token": script_args.hw_token,
+            "hw_name": hw_name,
+        }
+
     # 不再在主进程中处理inputs，改为传递文件路径给子进程
     # 子进程将重新读取文件并构建TVM对象
 
@@ -784,7 +848,7 @@ def main():
         else:
             device = f'cuda:{gpu_i}'
             print(f"Worker {gpu_i}: 使用设备 {device}")
-        p = Process(target=worker, args=(err_queue, save_path_i, script_args.sketch_path, gen_kwargs, script_args.model_path, script_args.adapter_path, script_args.multi_adapter_dir, script_args.target_hardware, script_args.target, device, script_args.allow_repeat, script_args.keep_cnt, script_args.is_build, gpu_i, num_gpus))
+        p = Process(target=worker, args=(err_queue, save_path_i, script_args.sketch_path, gen_kwargs, script_args.model_path, script_args.adapter_path, script_args.multi_adapter_dir, script_args.target_hardware, script_args.target, device, script_args.allow_repeat, script_args.keep_cnt, script_args.is_build, gpu_i, num_gpus, hw_injection_cfg))
         p.start()
         processes.append(p)
     for p in processes:

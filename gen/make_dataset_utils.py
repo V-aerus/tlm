@@ -1,5 +1,8 @@
 from transformers import AutoTokenizer
 from datasets import load_dataset
+from typing import Any, Dict, List, Optional, Tuple
+import copy
+import os
 
 
 def json_dfs_without_bracket(json, text_list: list):
@@ -40,12 +43,58 @@ def json_dfs_with_bracket(json, text_list: list):
         assert (False)
 
 
-def json_to_token(json_lines):
+def detect_hardware_from_target(target_str: str) -> Tuple[str, str]:
+    """Best-effort mapping from target string to (hw_id, hardware_name)."""
+    lower = target_str.lower()
+    if "sm_70" in lower or "v100" in lower:
+        return "v100", "nvidia/nvidia-v100"
+    if "sm_86" in lower or "4090" in lower or "a40" in lower:
+        return "4090", "nvidia/nvidia-a40"
+    if "xavier" in lower or "sm_72" in lower or "jetson" in lower:
+        return "xavier", "nvidia/jetson-agx-xavier"
+    if "llvm" in lower or "xeon" in lower or "skylake" in lower:
+        return "xeon", "aws/cpu/c5.18xlarge"
+    return "unknown", "unknown"
+
+
+def json_to_token(
+    json_lines: List[Dict[str, Any]],
+    hw_token_placeholder: Optional[str] = None,
+    hardware_embeddings: Optional[Dict[str, List[float]]] = None,
+    emit_hw_student: bool = False,
+):
     token_list = []
+    should_emit_student = emit_hw_student and hw_token_placeholder and hardware_embeddings
     for json_line in json_lines:
+        teacher_struct = copy.deepcopy(json_line["text"])
         text_list = []
-        json_dfs_without_bracket(json_line["text"], text_list)
+        json_dfs_without_bracket(teacher_struct, text_list)
         json_line["text"] = " ".join(text_list)
+
+        if should_emit_student:
+            try:
+                # task info 的第二个字段是 target 字符串
+                target_str = teacher_struct[1][0][1]
+            except Exception:
+                target_str = ""
+
+            student_struct = copy.deepcopy(teacher_struct)
+            try:
+                student_struct[1][0][1] = hw_token_placeholder
+            except Exception:
+                # 如果结构与预期不符，则跳过 student 文本
+                student_struct = None
+
+            if student_struct is not None and target_str:
+                student_text_tokens = []
+                json_dfs_without_bracket(student_struct, student_text_tokens)
+                json_line["text_student"] = " ".join(student_text_tokens)
+
+                hw_id, hw_name = detect_hardware_from_target(target_str)
+                if hw_name in hardware_embeddings:
+                    json_line["hw_id"] = hw_id
+                    json_line["hw_name"] = hw_name
+                    json_line["hw_emb"] = hardware_embeddings[hw_name]
         token_list.append(json_line)
     return token_list
 
@@ -151,3 +200,13 @@ def make_dataset_test(file, dataset_path, tokenizer_path, for_clm_or_mlm):
     )
 
     tokenized_datasets.save_to_disk(dataset_path)
+
+
+def filter_files_with_regex(files: List[str], pattern: Optional[str]) -> List[str]:
+    """Filter file list by regex on basename if pattern provided."""
+    if not pattern:
+        return files
+    import re
+
+    regex = re.compile(pattern)
+    return [f for f in files if regex.search(os.path.basename(f))]
