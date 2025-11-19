@@ -11,9 +11,11 @@ import signal
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List
+from typing import Dict, List, Optional
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser
 from transformers import get_scheduler
@@ -48,6 +50,8 @@ class TrainHwArgs:
     hw_noise_std: float = field(default=0.0, metadata={"help": "Std of Gaussian noise added to hw_emb (0 to disable)"})
     save_steps: int = field(default=1000, metadata={"help": "Save checkpoint every N steps"})
     save_total_limit: int = field(default=3, metadata={"help": "Maximum number of checkpoints to keep"})
+    lm_window_size: int = field(default=64, metadata={"help": "Number of tokens after hw token included in LM loss"})
+    lambda_cls: float = field(default=1.0, metadata={"help": "Weight for hardware classification loss"})
 
 
 def load_hardware_embeddings(path: str):
@@ -57,17 +61,23 @@ def load_hardware_embeddings(path: str):
 
 
 class HwStudentDataset(Dataset):
-    def __init__(self, dataset):
+    def __init__(self, dataset, proto_name_to_idx: Optional[Dict[str, int]] = None):
         self.dataset = dataset
+        self.proto_name_to_idx = proto_name_to_idx or {}
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
+        hw_name = item.get("hw_name")
+        hw_label = None
+        if hw_name is not None and hw_name in self.proto_name_to_idx:
+            hw_label = self.proto_name_to_idx[hw_name]
         return {
             "text_student": item["text_student"],
             "hw_emb": item["hw_emb"],
+            "hw_label": hw_label,
         }
 
 
@@ -91,11 +101,15 @@ class HwCollator:
         if self.hw_noise_std > 0:
             hw = hw + torch.randn_like(hw) * self.hw_noise_std
         labels = enc["input_ids"].clone()
+        hw_labels = torch.tensor(
+            [b["hw_label"] for b in batch], dtype=torch.long
+        )
         return {
             "input_ids": enc["input_ids"],
             "attention_mask": enc["attention_mask"],
             "labels": labels,
             "hw": hw,
+            "hw_label": hw_labels,
         }
 
 
@@ -144,16 +158,28 @@ def train():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # 加载硬件嵌入与原型信息（用于 ProtoMix 和分类头）
+    hardware_embeddings = load_hardware_embeddings(args.hardware_embedding_path)
+    prototype_names = [name.strip() for name in args.prototype_names.split(",") if name.strip()]
+    proto_matrix = build_prototype_matrix(hardware_embeddings, prototype_names)
+    proto_name_to_idx = {name: idx for idx, name in enumerate(prototype_names)}
+
     dataset = load_dataset("json", data_files=args.dataset_path)["train"]
-    required_cols = {"text_student", "hw_emb"}
+    required_cols = {"text_student", "hw_emb", "hw_name"}
     missing = required_cols - set(dataset.column_names)
     if missing:
         raise ValueError(f"Dataset missing required columns: {missing}")
 
-    dataset = dataset.filter(lambda x: x["text_student"] is not None and x["hw_emb"] is not None)
+    def _valid_example(x):
+        if x["text_student"] is None or x["hw_emb"] is None:
+            return False
+        name = x.get("hw_name")
+        return name is not None and name in proto_name_to_idx
+
+    dataset = dataset.filter(_valid_example)
     if args.sample_fraction and 0 < args.sample_fraction < 1:
         dataset = dataset.shuffle(seed=0).select(range(int(len(dataset) * args.sample_fraction)))
-    hf_dataset = HwStudentDataset(dataset)
+    hf_dataset = HwStudentDataset(dataset, proto_name_to_idx=proto_name_to_idx)
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     if tokenizer.pad_token_id is None:
@@ -176,9 +202,6 @@ def train():
     embed_layer = model.get_input_embeddings()
     embed_dim = embed_layer.embedding_dim
 
-    hardware_embeddings = load_hardware_embeddings(args.hardware_embedding_path)
-    prototype_names = [name.strip() for name in args.prototype_names.split(",") if name.strip()]
-    proto_matrix = build_prototype_matrix(hardware_embeddings, prototype_names)
     aligner = ProtoMixAligner(
         proto_matrix,
         embed_dim=embed_dim,
@@ -187,8 +210,15 @@ def train():
     )
     aligner.to(device)
 
+    # 硬件分类头（阶段 2）
+    num_hw_classes = len(prototype_names)
+    cls_head = nn.Linear(embed_dim, num_hw_classes)
+    cls_head.to(device)
+
     optimizer = torch.optim.AdamW(
-        aligner.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        list(aligner.parameters()) + list(cls_head.parameters()),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
 
     global_step = 0
@@ -240,6 +270,7 @@ def train():
 
     for epoch in range(args.num_epochs):
         aligner.train()
+        cls_head.train()
         optimizer.zero_grad()
         progress = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
         for batch_idx, batch in enumerate(progress):
@@ -247,17 +278,49 @@ def train():
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             hw_vec = batch["hw"].to(device)
+            hw_labels = batch["hw_label"].to(device)
 
             embeds = embed_layer(input_ids)
             hw_mask = (input_ids == hw_token_id)
             if not torch.all(hw_mask.any(dim=1)):
                 raise ValueError("Each sample must contain at least one hardware token")
 
+            # 局部 LM CE：只在 hw_token 之后的一段窗口内计算 loss
+            if args.lm_window_size and args.lm_window_size > 0:
+                ignore_index = -100
+                B, L = labels.size()
+                first_mask_pos = hw_mask.float().argmax(dim=1)  # 每行第一个 [MASK]
+                window = args.lm_window_size
+                for i in range(B):
+                    start = int(first_mask_pos[i].item()) + 1
+                    end = min(start + window, L)
+                    if start > 0:
+                        labels[i, :start] = ignore_index
+                    if end < L:
+                        labels[i, end:] = ignore_index
+
             hw_embed = aligner(hw_vec)
             embeds = torch.where(hw_mask.unsqueeze(-1), hw_embed.unsqueeze(1), embeds)
 
-            outputs = model(inputs_embeds=embeds, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss / args.grad_accum_steps
+            outputs = model(
+                inputs_embeds=embeds,
+                attention_mask=attention_mask,
+                labels=labels,
+                output_hidden_states=True,
+            )
+
+            loss_lm = outputs.loss
+
+            # 硬件分类头：使用 [MASK] 位置的隐藏状态
+            hidden_states = outputs.hidden_states[-1]  # [B, L, d]
+            B, L, _ = hidden_states.shape
+            mask_pos = hw_mask.float().argmax(dim=1)  # [B]
+            cls_features = hidden_states[torch.arange(B, device=device), mask_pos]
+            logits_hw = cls_head(cls_features)
+            loss_cls = F.cross_entropy(logits_hw, hw_labels)
+
+            total_loss = loss_lm + args.lambda_cls * loss_cls
+            loss = total_loss / args.grad_accum_steps
             loss.backward()
 
             if (batch_idx + 1) % args.grad_accum_steps == 0:
@@ -267,6 +330,8 @@ def train():
                 global_step += 1
                 if global_step % args.log_interval == 0:
                     loss_value = loss.item() * args.grad_accum_steps
+                    loss_lm_value = loss_lm.item()
+                    loss_cls_value = loss_cls.item()
                     
                     # 更新移动平均
                     loss_history.append(loss_value)
@@ -277,7 +342,9 @@ def train():
                     # 显示瞬时 loss 和移动平均 loss
                     progress.set_postfix({
                         "loss": f"{loss_value:.4f}",
-                        "avg": f"{moving_avg_loss:.4f}"
+                        "lm": f"{loss_lm_value:.4f}",
+                        "cls": f"{loss_cls_value:.4f}",
+                        "avg": f"{moving_avg_loss:.4f}",
                     })
                     
                     # 记录日志
@@ -285,6 +352,8 @@ def train():
                         "step": global_step,
                         "epoch": epoch + 1,
                         "loss": loss_value,
+                        "loss_lm": loss_lm_value,
+                        "loss_cls": loss_cls_value,
                         "moving_avg_loss": moving_avg_loss,
                         "timestamp": datetime.now().isoformat()
                     }
@@ -292,7 +361,11 @@ def train():
                     
                     # 写入文本日志（包含移动平均）
                     with open(log_file, "a", encoding="utf-8") as f:
-                        f.write(f"Step {global_step:6d} | Epoch {epoch+1}/{args.num_epochs} | Loss: {loss_value:.6f} | Avg: {moving_avg_loss:.6f}\n")
+                        f.write(
+                            f"Step {global_step:6d} | Epoch {epoch+1}/{args.num_epochs} | "
+                            f"Loss: {loss_value:.6f} | LM: {loss_lm_value:.6f} | "
+                            f"CLS: {loss_cls_value:.6f} | Avg: {moving_avg_loss:.6f}\n"
+                        )
                 
                 # 保存 checkpoint
                 if global_step % args.save_steps == 0:
@@ -303,6 +376,7 @@ def train():
                         "step": global_step,
                         "epoch": epoch + 1,
                         "state_dict": aligner.state_dict(),
+                        "cls_head_state_dict": cls_head.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "prototype_names": prototype_names,
                         "prototype_keys": proto_matrix.tolist(),
@@ -325,6 +399,7 @@ def train():
                             print(f"[Checkpoint] 已删除旧检查点: {old_checkpoint}")
 
     aligner.eval()
+    cls_head.eval()
     
     # 保存最终训练日志
     training_logs["final_step"] = global_step
@@ -342,6 +417,7 @@ def train():
     
     ckpt = {
         "state_dict": aligner.state_dict(),
+        "cls_head_state_dict": cls_head.state_dict(),
         "prototype_names": prototype_names,
         "prototype_keys": proto_matrix.tolist(),
         "hw_token": args.hw_token,

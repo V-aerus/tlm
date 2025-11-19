@@ -27,7 +27,7 @@ export PYTHONUNBUFFERED=1
     --trainable_temperature False \
     --warmup_steps 1500 \
     --lr_scheduler_type cosine \
-    --sample_fraction 0.02 \
+    --sample_fraction 0.1\
     --hw_noise_std 0.0 \
     --device cuda
 

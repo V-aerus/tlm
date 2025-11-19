@@ -1,7 +1,8 @@
 # EdgeTLM 快速手册（2025-02 更新）
 
--codex resume 019a48d6-27ec-7611-8c72-01163e73d45e
-
+codex resume 019a48d6-27ec-7611-8c72-01163e73d45e
+codex resume 019a5410-3c48-7cf3-8051-1ed95df16fdf -m gpt-5-codex
+codex resume 019a95a5-8d92-7a21-935b-fce164b12d58
 
 本文档汇总当前 EdgeTLM 管线的关键命令与目录规划，覆盖 V100 与 RTX4090 两个硬件场景。路径均以仓库根目录 `/home/hehangshuai/workspace/tlm/gen` 与数据根 `/home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data` 为基准，请按照实际需求调整。
 
