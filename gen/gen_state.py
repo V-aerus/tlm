@@ -814,6 +814,14 @@ def main():
             "hw_name": hw_name,
         }
 
+        # 若未显式指定 adapter_path，且对齐器 ckpt 所在目录包含 LoRA 适配器，则自动启用 LoRA（Mode B）
+        if script_args.adapter_path is None:
+            ckpt_dir = os.path.dirname(script_args.hw_aligner_path)
+            adapter_file = os.path.join(ckpt_dir, "adapter_model.safetensors")
+            if os.path.exists(adapter_file):
+                script_args.adapter_path = ckpt_dir
+                print(f"Detected LoRA adapter at {ckpt_dir}, enabling HwToken injection with LoRA (Mode B).")
+
     # 不再在主进程中处理inputs，改为传递文件路径给子进程
     # 子进程将重新读取文件并构建TVM对象
 

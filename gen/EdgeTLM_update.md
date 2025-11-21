@@ -718,24 +718,27 @@ python train_edge_expert.py \
   - 兼容性：不改 Base 结构、不改外部产物形态（记录版 JSON），与 Edge 专家/LoRA 门控独立。
 • 本次改动
 
-  - make_dataset_utils.py / make_dataset.py：新增
-  --emit_hw_student、--hw_token_placeholder、--hardware_embedding_path，在生成 0_merge.json 时可额外输出
-  text_student、hw_emb 等字段；并在 json_to_token/input_to_tokens 里支持将 target 文本替换为占位符，方便后续 HwToken
-  训练与推理。
-  - modeling/hw_injection.py / modeling/__init__.py：新增 ProtoMix 对齐器实现（包含构建原型矩阵的辅助函数），统一导出
-  供训练与推理侧加载。
-  - train_hw_injection.py：新建训练脚本，冻结 TLM-Base，仅训练 ProtoMix；直接复用 CLM CE Loss，支持自定义原型列表、占
-  位符 Token、Grad Accumulate 等，训练完成后输出 hw_aligner.pt。
-  - gen/gen_state.py：加入 --hw_injection/--hw_aligner_path/--hw_token 等开关；在 worker 内加载 ProtoMix、注入 HwToken
-  占位符并用 inputs_embeds 前向，从而在推理时绕开硬件 OOV。新增 prepare_hw_injection_context、hw_injection_cfg 在多进
-  程间传递，确保模型生成流程与原有 Edge/LoRA 逻辑兼容。
-  - 其他：对 train_hw_injection.py 的 checkpoint 新增 embed_dim，方便推理侧还原；在 make_dataset_utils 增加硬件识别工
-  具函数并导出 hw_emb。
+  - make_dataset_utils.py / make_dataset.py：  
+    - 新增 `--emit_hw_student`、`--hw_token_placeholder`、`--hardware_embedding_path`，在生成 0_merge.json 时可额外输出 `text_student`、`hw_emb` 等字段；  
+    - `json_to_token/input_to_tokens` 支持将 target 文本替换为占位符，并在启用 HwToken 占位时同时清空硬件参数数组，保证训练与推理侧 prompt 清洗方式一致。
+  - modeling/hw_injection.py / modeling/__init__.py：  
+    - 新增 ProtoMix 对齐器实现（包含构建原型矩阵的辅助函数），统一导出供训练与推理侧加载；  
+    - 对齐器内增加原型正交正则（`get_ortho_loss`），鼓励语义原型在 embedding 空间中分散。
+  - train_hw_injection.py：  
+    - 初版实现冻结 TLM-Base、仅训练 ProtoMix 的 Hw 注入脚本（CLM CE + 硬件分类 + 正交正则），输出 `hw_aligner.pt`；  
+    - 后续迭代引入 SupCon 风格对比学习与日志增强，实验结果表明在“Base 完全冻结”设定下，注入在 `gen_state+TVM` 链路中整体失败（全部 state invalid），主要只能学到“通用 GPU token + 略微区分 CPU”的粗粒度解，已在背景文档中记录为负例。  
+  - train_hw_injection_lora.py（新）：  
+    - 在冻结 Base 的前提下，为 Base 挂一套 LoRA，并与 ProtoMix 对齐器联合训练；  
+    - 输入为 `text/text_student/hw_emb`，其中 `text_student` 已替换 target→HwToken 并去掉 8 个硬件参数整数；  
+    - 损失组合为局部 LM CE（LoRA+Aligner）、硬件分类（`cls_head(hw_embed)`）、原型正交正则（`get_ortho_loss`），并保留对比学习（CTR）与蒸馏（KD）的接口（默认关闭），形成“LoRA+Aligner 适配新格式”的训练路径。  
+  - gen/gen_state.py：  
+    - 早期版本加入 `--hw_injection/--hw_aligner_path/--hw_token` 开关，在 worker 内加载 ProtoMix 并以 inputs_embeds 注入 HwToken，占位符文本仍由 `input_to_tokens` 构造；  
+    - 在本次更新中，`input_to_tokens` 的 Hw 占位逻辑与 `text_student` 清洗保持一致（target→占位符 + 清空硬件参数数组），并通过 `prepare_hw_injection_context` 统一加载 `hw_aligner[+lora]`，确保推理 prompt 分布与训练侧一致。  
+  - run_train_hw_injection_lora.sh：  
+    - 新增运行脚本，使用多硬件 CLM 基座与 multi-tokenizer，对 `align_train_multi_merged/0_merge.json` 上的部分样本（可控 `sample_fraction`）进行 LoRA+ProtoMix 训练，输出 `{student（LoRA权重）, tokenizer, hw_aligner_lora.pt}`。
 
   后续可选操作
 
-  1. 运行 make_dataset.py ... --emit_hw_student --hw_token_placeholder [MASK] 重新导出带 text_student/hw_emb 的
-  0_merge.json。
-  2. 用 train_hw_injection.py 训练 ProtoMix，对输出的 hw_aligner.pt 执行 LOHO/插值验证。
-  3. 推理时在 gen_state.py 增加 --hw_injection --hw_aligner_path ... --hw_token [MASK]，即可启用 HwToken 注入。如需兜
-  底或 Few-shot，可继续按计划扩展。
+  1. 运行 `make_dataset.py ... --emit_hw_student --hw_token_placeholder [MASK]` 重新导出带 `text_student/hw_emb` 的 0_merge.json，并用 `postprocess_align_hw_mask.py` 确保硬件参数整数在 student 文本中被清洗掉。  
+  2. 用 `train_hw_injection_lora.py` 在注入格式的 prompt 上训练 LoRA+ProtoMix，观察局部 LM/CLS/ORTH 的收敛情况，再结合 `debug_hw_aligner_mixture.py` 检查几何行为。  
+  3. 在 `gen_state.py` 中，通过 `--hw_injection --hw_aligner_path ... --hw_token [MASK]` 尝试在新/未见硬件上启用 HwToken 注入，对比“原始 target 流 vs 注入+LoRA+ProtoMix”的行为与 TVM 合法性，逐步评估该方案在 EdgeTLM 全链路中的可用性与局限。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train ProtoMix hardware token aligner with frozen TLM-Base."""
+"""Train ProtoMix hardware token aligner with frozen TLM-Base (Stage 3: Contrastive + Ortho)."""
 
 from __future__ import annotations
 
@@ -49,9 +49,13 @@ class TrainHwArgs:
     sample_fraction: float = field(default=None, metadata={"help": "Optional fraction of data to sample (0,1]"})
     hw_noise_std: float = field(default=0.0, metadata={"help": "Std of Gaussian noise added to hw_emb (0 to disable)"})
     save_steps: int = field(default=1000, metadata={"help": "Save checkpoint every N steps"})
-    save_total_limit: int = field(default=3, metadata={"help": "Maximum number of checkpoints to keep"})
+    save_total_limit: int = field(default=5, metadata={"help": "Maximum number of checkpoints to keep"})
     lm_window_size: int = field(default=64, metadata={"help": "Number of tokens after hw token included in LM loss"})
     lambda_cls: float = field(default=1.0, metadata={"help": "Weight for hardware classification loss"})
+    # 对比学习与正交正则（当前默认关闭 CTR）
+    lambda_ctr: float = field(default=0.0, metadata={"help": "Weight for InfoNCE contrastive loss"})
+    lambda_ortho: float = field(default=0.1, metadata={"help": "Weight for prototype orthogonality loss"})
+    ctr_temp: float = field(default=0.1, metadata={"help": "Temperature for InfoNCE loss"})
 
 
 def load_hardware_embeddings(path: str):
@@ -158,18 +162,14 @@ def train():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 加载硬件嵌入与原型信息（用于 ProtoMix 和分类头）
+    # 加载硬件嵌入与原型信息
     hardware_embeddings = load_hardware_embeddings(args.hardware_embedding_path)
     prototype_names = [name.strip() for name in args.prototype_names.split(",") if name.strip()]
     proto_matrix = build_prototype_matrix(hardware_embeddings, prototype_names)
     proto_name_to_idx = {name: idx for idx, name in enumerate(prototype_names)}
 
     dataset = load_dataset("json", data_files=args.dataset_path)["train"]
-    required_cols = {"text_student", "hw_emb", "hw_name"}
-    missing = required_cols - set(dataset.column_names)
-    if missing:
-        raise ValueError(f"Dataset missing required columns: {missing}")
-
+    
     def _valid_example(x):
         if x["text_student"] is None or x["hw_emb"] is None:
             return False
@@ -190,7 +190,8 @@ def train():
         raise ValueError(f"Tokenizer does not know token '{args.hw_token}'")
 
     collator = HwCollator(tokenizer, hw_token_id, args.max_length, hw_noise_std=args.hw_noise_std)
-    dataloader = DataLoader(hf_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collator)
+    dataloader = DataLoader(hf_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collator, drop_last=True) 
+    # 注意：drop_last=True 推荐开启，避免最后一个 batch size=1 导致 Contrastive Loss 报错
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -210,7 +211,7 @@ def train():
     )
     aligner.to(device)
 
-    # 硬件分类头（阶段 2）
+    # 硬件分类头
     num_hw_classes = len(prototype_names)
     cls_head = nn.Linear(embed_dim, num_hw_classes)
     cls_head.to(device)
@@ -223,21 +224,17 @@ def train():
 
     global_step = 0
     
-    # 直接使用数据集大小计算总步数，避免 DataLoader len() 的缓存问题
     dataset_len = len(hf_dataset)
     steps_per_epoch = math.ceil(dataset_len / args.batch_size / max(1, args.grad_accum_steps))
     total_steps = steps_per_epoch * args.num_epochs
     
-    # Loss 移动平均（用于平滑显示）
     loss_history = []
-    loss_window = 50  # 移动平均窗口大小
+    loss_window = 50
     
-    # Checkpoint 管理
     checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    saved_checkpoints = []  # 保存的 checkpoint 路径列表
+    saved_checkpoints = []
 
-    # 设置日志保存
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -248,17 +245,15 @@ def train():
     training_logs = {
         "config": vars(args),
         "total_steps": total_steps,
-        "total_samples": dataset_len,
         "logs": []
     }
     
     print(f"\n[数据集信息]")
     print(f"  数据集大小: {dataset_len:,}")
     print(f"  Batch size: {args.batch_size}")
-    print(f"  每个 epoch 步数: {steps_per_epoch:,}")
-    print(f"  总步数: {total_steps:,}")
+    print(f"  策略: LM + CLS + InfoNCE + Ortho")
+    print(f"  权重: CLS={args.lambda_cls}, CTR={args.lambda_ctr}, Ortho={args.lambda_ortho}")
     print(f"\n训练日志将保存到: {log_file}")
-    print(f"训练指标将保存到: {log_json_file}")
     print()
 
     scheduler = get_scheduler(
@@ -285,11 +280,11 @@ def train():
             if not torch.all(hw_mask.any(dim=1)):
                 raise ValueError("Each sample must contain at least one hardware token")
 
-            # 局部 LM CE：只在 hw_token 之后的一段窗口内计算 loss
+            # 1. 局部 LM Loss 准备
             if args.lm_window_size and args.lm_window_size > 0:
                 ignore_index = -100
                 B, L = labels.size()
-                first_mask_pos = hw_mask.float().argmax(dim=1)  # 每行第一个 [MASK]
+                first_mask_pos = hw_mask.float().argmax(dim=1)
                 window = args.lm_window_size
                 for i in range(B):
                     start = int(first_mask_pos[i].item()) + 1
@@ -299,7 +294,8 @@ def train():
                     if end < L:
                         labels[i, end:] = ignore_index
 
-            hw_embed = aligner(hw_vec)
+            # 2. 注入
+            hw_embed = aligner(hw_vec)  # [B, d]
             embeds = torch.where(hw_mask.unsqueeze(-1), hw_embed.unsqueeze(1), embeds)
 
             outputs = model(
@@ -311,15 +307,61 @@ def train():
 
             loss_lm = outputs.loss
 
-            # 硬件分类头：使用 [MASK] 位置的隐藏状态
+            # 3. 提取 Context 表示 (用于对比学习)
             hidden_states = outputs.hidden_states[-1]  # [B, L, d]
             B, L, _ = hidden_states.shape
-            mask_pos = hw_mask.float().argmax(dim=1)  # [B]
-            cls_features = hidden_states[torch.arange(B, device=device), mask_pos]
-            logits_hw = cls_head(cls_features)
+            mask_pos = hw_mask.float().argmax(dim=1)
+            
+            # z_prog: 程序上下文在 [MASK] 处的表示
+            z_prog = hidden_states[torch.arange(B, device=device), mask_pos] # [B, d]
+
+            # 4. 硬件分类 Loss：直接监督 hw_embed，避免分类头只依赖上下文作弊
+            logits_hw = cls_head(hw_embed)
             loss_cls = F.cross_entropy(logits_hw, hw_labels)
 
-            total_loss = loss_lm + args.lambda_cls * loss_cls
+            # 5. (修正版) 有监督对比学习 Loss (SupCon)
+            if args.lambda_ctr > 0 and B > 1:
+                z_prog_norm = F.normalize(z_prog, dim=-1)
+                z_hw_norm = F.normalize(hw_embed, dim=-1)
+                
+                # [B, B] 相似度矩阵
+                logits = torch.matmul(z_prog_norm, z_hw_norm.t()) / args.ctr_temp
+                
+                # 构建 Mask，标记出哪些是同类硬件
+                # hw_labels: [B]，labels_mask[i, j] = 1 表示 i 和 j 是同一种硬件
+                labels_mask = (hw_labels.unsqueeze(0) == hw_labels.unsqueeze(1)).float()
+                
+                # 为了数值稳定性，减去最大值
+                logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+                logits = logits - logits_max.detach()
+                
+                # 计算 LogSoftmax
+                exp_logits = torch.exp(logits)
+                log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+                
+                # SupCon：只计算正样本位置的 log_prob 平均值
+                mask_sum = labels_mask.sum(1)
+                mask_sum = torch.where(mask_sum == 0, torch.ones_like(mask_sum), mask_sum)
+                mean_log_prob_pos = (labels_mask * log_prob).sum(1) / mask_sum
+                
+                loss_ctr = - mean_log_prob_pos.mean()
+            else:
+                loss_ctr = torch.tensor(0.0, device=device)
+
+            # 6. 正交正则 Loss
+            if args.lambda_ortho > 0:
+                loss_ortho = aligner.get_ortho_loss()
+            else:
+                loss_ortho = torch.tensor(0.0, device=device)
+
+            # 总 Loss
+            total_loss = (
+                loss_lm + 
+                args.lambda_cls * loss_cls + 
+                args.lambda_ctr * loss_ctr + 
+                args.lambda_ortho * loss_ortho
+            )
+            
             loss = total_loss / args.grad_accum_steps
             loss.backward()
 
@@ -329,106 +371,82 @@ def train():
                 optimizer.zero_grad()
                 global_step += 1
                 if global_step % args.log_interval == 0:
-                    loss_value = loss.item() * args.grad_accum_steps
-                    loss_lm_value = loss_lm.item()
-                    loss_cls_value = loss_cls.item()
+                    loss_val = loss.item() * args.grad_accum_steps
+                    lm_val = loss_lm.item()
+                    cls_val = loss_cls.item()
+                    ctr_val = loss_ctr.item()
+                    orth_val = loss_ortho.item()
                     
-                    # 更新移动平均
-                    loss_history.append(loss_value)
+                    loss_history.append(loss_val)
                     if len(loss_history) > loss_window:
                         loss_history.pop(0)
-                    moving_avg_loss = sum(loss_history) / len(loss_history)
+                    moving_avg = sum(loss_history) / len(loss_history)
                     
-                    # 显示瞬时 loss 和移动平均 loss
                     progress.set_postfix({
-                        "loss": f"{loss_value:.4f}",
-                        "lm": f"{loss_lm_value:.4f}",
-                        "cls": f"{loss_cls_value:.4f}",
-                        "avg": f"{moving_avg_loss:.4f}",
+                        "loss": f"{loss_val:.2f}",
+                        "lm": f"{lm_val:.2f}",
+                        "cls": f"{cls_val:.2f}",
+                        "ctr": f"{ctr_val:.2f}",
+                        "orth": f"{orth_val:.2f}"
                     })
                     
-                    # 记录日志
                     log_entry = {
                         "step": global_step,
-                        "epoch": epoch + 1,
-                        "loss": loss_value,
-                        "loss_lm": loss_lm_value,
-                        "loss_cls": loss_cls_value,
-                        "moving_avg_loss": moving_avg_loss,
+                        "loss": loss_val,
+                        "loss_lm": lm_val,
+                        "loss_cls": cls_val,
+                        "loss_ctr": ctr_val,
+                        "loss_ortho": orth_val,
                         "timestamp": datetime.now().isoformat()
                     }
                     training_logs["logs"].append(log_entry)
                     
-                    # 写入文本日志（包含移动平均）
                     with open(log_file, "a", encoding="utf-8") as f:
                         f.write(
-                            f"Step {global_step:6d} | Epoch {epoch+1}/{args.num_epochs} | "
-                            f"Loss: {loss_value:.6f} | LM: {loss_lm_value:.6f} | "
-                            f"CLS: {loss_cls_value:.6f} | Avg: {moving_avg_loss:.6f}\n"
+                            f"Step {global_step:5d} | "
+                            f"Loss: {loss_val:.4f} | LM: {lm_val:.4f} | CLS: {cls_val:.4f} | "
+                            f"CTR: {ctr_val:.4f} | ORTH: {orth_val:.4f}\n"
                         )
                 
-                # 保存 checkpoint
                 if global_step % args.save_steps == 0:
                     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint-{global_step}")
                     os.makedirs(checkpoint_path, exist_ok=True)
-                    
                     ckpt = {
-                        "step": global_step,
-                        "epoch": epoch + 1,
                         "state_dict": aligner.state_dict(),
                         "cls_head_state_dict": cls_head.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
+                        "config": vars(args),
                         "prototype_names": prototype_names,
                         "prototype_keys": proto_matrix.tolist(),
                         "hw_token": args.hw_token,
                         "hw_token_id": hw_token_id,
                         "tokenizer_path": args.tokenizer_path,
                         "embed_dim": embed_dim,
-                        "config": vars(args),
                     }
                     torch.save(ckpt, os.path.join(checkpoint_path, "hw_aligner.pt"))
-                    
                     saved_checkpoints.append(checkpoint_path)
-                    print(f"\n[Checkpoint] 已保存检查点到: {checkpoint_path}")
-                    
-                    # 清理旧 checkpoint（保留最新的 N 个）
                     if len(saved_checkpoints) > args.save_total_limit:
-                        old_checkpoint = saved_checkpoints.pop(0)
-                        if os.path.exists(old_checkpoint):
-                            shutil.rmtree(old_checkpoint)
-                            print(f"[Checkpoint] 已删除旧检查点: {old_checkpoint}")
+                        shutil.rmtree(saved_checkpoints.pop(0))
 
     aligner.eval()
-    cls_head.eval()
     
-    # 保存最终训练日志
-    training_logs["final_step"] = global_step
-    training_logs["completed_at"] = datetime.now().isoformat()
-    with open(log_json_file, "w", encoding="utf-8") as f:
-        json.dump(training_logs, f, indent=2, ensure_ascii=False)
-    
-    # 写入最终日志条目
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(f"\n训练完成 | 总步数: {global_step} | 完成时间: {datetime.now().isoformat()}\n")
-    
-    print(f"\n训练日志已保存:")
-    print(f"  - 文本日志: {log_file}")
-    print(f"  - JSON日志: {log_json_file}")
-    
+    # 保存最终模型
     ckpt = {
         "state_dict": aligner.state_dict(),
         "cls_head_state_dict": cls_head.state_dict(),
+        "config": vars(args),
         "prototype_names": prototype_names,
         "prototype_keys": proto_matrix.tolist(),
         "hw_token": args.hw_token,
         "hw_token_id": hw_token_id,
         "tokenizer_path": args.tokenizer_path,
         "embed_dim": embed_dim,
-        "config": vars(args),
     }
     torch.save(ckpt, os.path.join(args.output_dir, "hw_aligner.pt"))
-    with open(os.path.join(args.output_dir, "hw_aligner_config.json"), "w", encoding="utf-8") as f:
-        json.dump(ckpt["config"], f, indent=2)
+    
+    # 保存日志
+    with open(log_json_file, "w", encoding="utf-8") as f:
+        json.dump(training_logs, f, indent=2)
+    print(f"训练结束，日志已保存至 {log_file}")
 
 
 if __name__ == "__main__":

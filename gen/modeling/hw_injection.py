@@ -25,11 +25,14 @@ class ProtoMixAligner(nn.Module):
         if prototype_keys.ndim != 2:
             raise ValueError("prototype_keys must be 2-D (num_proto, key_dim)")
 
+        # prototype_keys 是固定的参考点 (来自 JSON)，用于计算相似度权重
         proto = F.normalize(prototype_keys.float(), dim=-1)
         self.register_buffer("prototype_keys", proto)
         num_proto = proto.size(0)
         self.embed_dim = embed_dim
 
+        # prototypes 是可学习的嵌入向量，用于最终的混合输出
+        #
         self.prototypes = nn.Parameter(torch.randn(num_proto, embed_dim) * 0.02)
 
         if trainable_temperature:
@@ -51,13 +54,33 @@ class ProtoMixAligner(nn.Module):
             raise ValueError("hw_vec must be 2-D (batch, key_dim)")
         proto = self.prototype_keys
         hw_norm = F.normalize(hw_vec, dim=-1)
+        
+        # 计算输入硬件与固定 key 的相似度
         sim = torch.matmul(hw_norm, proto.t())  # (B, num_proto)
         temp = self.get_temperature()
         weights = torch.softmax(sim / temp, dim=-1)
+        
+        # 混合可学习的原型向量
         mix = torch.matmul(weights, self.prototypes)
+        
         if return_weights:
             return mix, weights
         return mix
+
+    def get_ortho_loss(self) -> torch.Tensor:
+        """
+        计算可学习原型的正交正则化损失。
+        目标：鼓励 self.prototypes 之间尽可能正交（互不相同），防止坍塌。
+        """
+        # 对原型向量归一化
+        p_norm = F.normalize(self.prototypes, dim=-1)
+        # 计算 Gram 矩阵 (余弦相似度矩阵)
+        gram = torch.matmul(p_norm, p_norm.t())  # (num_proto, num_proto)
+        # 目标是单位矩阵 (对角线为1，其余为0)
+        eye = torch.eye(gram.size(0), device=gram.device)
+        # 计算 MSE 损失
+        loss = torch.mean((gram - eye) ** 2)
+        return loss
 
     def extra_repr(self) -> str:
         return (
