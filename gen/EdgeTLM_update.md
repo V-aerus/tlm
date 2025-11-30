@@ -742,3 +742,100 @@ python train_edge_expert.py \
   1. 运行 `make_dataset.py ... --emit_hw_student --hw_token_placeholder [MASK]` 重新导出带 `text_student/hw_emb` 的 0_merge.json，并用 `postprocess_align_hw_mask.py` 确保硬件参数整数在 student 文本中被清洗掉。  
   2. 用 `train_hw_injection_lora.py` 在注入格式的 prompt 上训练 LoRA+ProtoMix，观察局部 LM/CLS/ORTH 的收敛情况，再结合 `debug_hw_aligner_mixture.py` 检查几何行为。  
   3. 在 `gen_state.py` 中，通过 `--hw_injection --hw_aligner_path ... --hw_token [MASK]` 尝试在新/未见硬件上启用 HwToken 注入，对比“原始 target 流 vs 注入+LoRA+ProtoMix”的行为与 TVM 合法性，逐步评估该方案在 EdgeTLM 全链路中的可用性与局限。
+
+  11 月 26 日 update：
+HwToken 注入方案阶段一：几何对齐 + 后层 LoRA（2025-11-26）
+
+失败回顾（旧版 ProtoMix + 全层 LoRA）
+
+早期版本采用 ProtoMix Aligner + 全 12 层 LoRA 的设计：在 text_student 中用 [MASK] [MASK] [MASK] [MASK] 替换原始硬件 target，再由 ProtoMix 从 hw_emb 生成注入向量，配合 LM / CLS / KD / ORTH 多任务训练。
+
+实验现象：
+
+即使在已见硬件（V100/4090/Jetson/CPU）上，gen_state.py --hw_injection 生成结果大量出现 “All states are invalid”，合法 schedule 近乎为 0；
+
+debug_short_gen.py 在短程生成中出现 [SEP] 1 0 auto_unroll_max_step$512 ... 1 1 1 1 1 ... 等循环垃圾 token，说明 Base 的张量 DSL 语法已被破坏；
+
+训练 log 中 LM 与 CLS 呈明显“跷跷板”：CLS 降、LM 就涨，反之亦然，KD 也难以稳定收敛。
+
+事后分析：
+
+LoRA 全层注入等价于“重写一个新的 TLM”，导致 Base 早期负责“合法性 + 语法”的低层表征被改坏；
+
+Aligner 只有 LM/CLS/KD 的间接监督，且 KD 过早介入、Teacher/Student 输入分布差异较大，使对齐器学到的是“为了分辨硬件/CLS”而不是“生成原生硬件 embedding”；
+
+8 个硬件整数仍暴露在 text_student 里，Student 可以“偷看数字”而不必真正利用 hw_emb，进一步削弱了 Aligner 的学习信号。
+
+反思与设计原则
+
+将任务拆成 “语法/合法性恢复” 与 “硬件 → 策略微调” 两个阶段，优先保证 Base 的 DSL 能力不被破坏；
+
+让硬件语义主要通过 少量 HwToken 注入，而不是让 LoRA 去“强行记住硬件名字”；
+
+给对齐器一个 显式几何锚点：它输出的 4 个 HwToken，要在 embedding 空间里尽量贴近 Base 过去看到的真实硬件子串表示，而不是只靠 LM/CLS 的间接约束；
+
+LoRA 只负责在后几层“调策略”，而不参与早期对硬件字段的解析与句法建模。
+
+新方法摘要（Stage-1 版本）
+
+4 段 HwToken 语义重新定义
+
+ARCH：架构身份（cuda -keys=... -arch=sm_xx 或 llvm -keys=cpu -mcpu=...）；
+
+CONS：硬约束常数（以 -thread_warp_size 为锚点，之后的 8 个整数）；
+
+MEM / HOST：当前版本先保守处理，JETSON 的 LLVM 段可视为 HOST，其余硬件视为 inactive，后续再逐步启用。
+
+对齐器结构从 ProtoMix 简化为 4 个线性头
+
+输入仍为全局 hw_emb（多维硬件特征）；
+
+为 ARCH / MEM / CONS / HOST 各定义一个独立线性层，输出 4 个 d_model 维 HwToken 向量，在 text_student 中覆盖 [MASK] × 4 的 embedding；
+
+线性对齐器对所有硬件共享，只在少数参数上学习“如何把通用硬件 embedding 投到 Base 的词嵌入空间”。
+
+几何监督：预计算 Base 看到的“硬件子串目标”
+
+新增 precompute_hw_token_targets.py，对每个硬件使用 规范化 target 串（只含硬件参数，不含张量 DSL），用 Base 的 embedding + mean pooling 得到：
+
+E_ARCH_base(h)：从 cuda/llvm 开始到 CONS 段前的子串；
+
+E_CONS_base(h)：以 -thread_warp_size 为锚点后紧随的 8 个整数；
+
+E_MEM_base(h) / E_HOST_base(h)：当前仅对 Jetson 等有明确 Host 段的硬件启用，其余用 mask 跳过。
+
+将上述结果保存为 hw_token_targets_v1.pt，训练时按 hw_name 查表。
+
+在 train_hw_injection_lora.py 中为 4 个 HwToken 增加几何 loss：
+总损失为 loss = lm + λ_geom * geom + λ_orth * orth + λ_cls * cls，其中 Stage-1 设 λ_geom≈1.0，λ_cls 极小，λ_kd=0。
+
+LoRA 只挂在最后 4 层 MLP
+
+通过模块名过滤仅在 transformer.h.8~11.mlp.{c_fc,c_proj} 上插 LoRA，前 8 层保持完全冻结；
+
+这样 Base 的低层继续负责张量语言的合法性与基本调度语法，LoRA 只在高层调整不同硬件下的策略偏好。
+
+训练与实验进度（Stage-1）
+
+数据：使用 align_train_multi_merged_no_ints/0_merge.json，在 text_student 中用 [MASK]×4 替换 target，并彻底移除那 8 个硬件整数，避免 Student“偷看”原始约束；样本规模约 230 万条，多硬件混合。
+
+训练配置：
+
+LoRA：r=16, alpha=32, dropout=0.05，仅最后 4 层 MLP，约 49 万可训练参数；
+
+loss：λ_lm=1.0, λ_geom≈1.0, λ_orth=0.1, λ_cls=0.01, λ_kd=0；
+
+在线 debug_short_gen 使用 Stage-1 模型和新的 HwToken 注入路径，周期性抽样检查语法是否稳定。
+
+当前观察：
+
+总 loss 从 8.x 降至 3–4 区间，LM loss 虽仍有震荡，但不再出现明显“CLS 降 LM 飙”的极端对立，训练过程比旧方案稳；
+
+下一步将以 gen_state.py --hw_injection 在已见硬件上系统评估合法率，并与 “无注入 + 纯 LoRA” 和 “原始 TLM-Base” 基线对比，确认 Stage-1 是否恢复了基本语法与合法性，然后再考虑 Stage-2 的轻量 KD / 簇级 CLS 设计。
+
+
+11.30日
+  当前做法：4 个 hw 向量，注入到 prompt 中的做法，通过多次检测，发现可能会
+  - 4-MASK + patch 注入的推理实验显示：虽然能生成 token，但语法被严重破坏，模型倾向复读硬件参数/数字，TVM 全部 invalid。
+  - 离线检查 aligner 输出几何位置正常（与 prototype/target 余弦高），问题集中在 4-MASK 句法/解码习惯：替换硬件子句后，模型把硬件串当成续写，合法 schedule 稀缺。
+  - 已试 embedding patch + greedy 解码绕过 HF+PEFT inputs_embeds bug，生成不再为空但仍不合法，提示需要在训练/掩码/提示格式上进一步调整（如更强的 schedule 监督、首 token 约束等）。

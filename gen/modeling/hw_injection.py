@@ -42,13 +42,30 @@ class ProtoMixAligner(nn.Module):
             self.log_temp = None
             self.register_buffer("temperature", torch.tensor(float(temperature)))
 
+        # 4 个头用于拆分不同硬件语义分量的投影
+        self.head_arch = nn.Linear(embed_dim, embed_dim)
+        self.head_mem = nn.Linear(embed_dim, embed_dim)
+        self.head_cons = nn.Linear(embed_dim, embed_dim)
+        self.head_host = nn.Linear(embed_dim, embed_dim)
+
     def get_temperature(self) -> torch.Tensor:
         if self.log_temp is not None:
             return torch.exp(self.log_temp)
         return self.temperature
 
-    def forward(self, hw_vec: torch.Tensor, return_weights: bool = False):
-        """Map hardware vectors (B, D_key) to embedding vectors (B, embed_dim)."""
+    def forward(
+        self,
+        hw_vec: torch.Tensor,
+        return_weights: bool = False,
+        split_heads: bool = False,
+    ):
+        """Map hardware vectors (B, D_key) to embedding vectors.
+
+        Args:
+            hw_vec: (B, D_key)
+            return_weights: whether to return mixing weights
+            split_heads: if True, return shape (B,4,D) via four linear heads
+        """
 
         if hw_vec.ndim != 2:
             raise ValueError("hw_vec must be 2-D (batch, key_dim)")
@@ -61,11 +78,25 @@ class ProtoMixAligner(nn.Module):
         weights = torch.softmax(sim / temp, dim=-1)
         
         # 混合可学习的原型向量
-        mix = torch.matmul(weights, self.prototypes)
+        feat = torch.matmul(weights, self.prototypes)  # (B, D)
+
+        if split_heads:
+            mix4 = torch.stack(
+                [
+                    self.head_arch(feat),
+                    self.head_mem(feat),
+                    self.head_cons(feat),
+                    self.head_host(feat),
+                ],
+                dim=1,
+            )  # (B, 4, D)
+            if return_weights:
+                return mix4, weights
+            return mix4
         
         if return_weights:
-            return mix, weights
-        return mix
+            return feat, weights
+        return feat
 
     def get_ortho_loss(self) -> torch.Tensor:
         """

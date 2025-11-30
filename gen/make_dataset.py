@@ -259,14 +259,9 @@ def input_to_tokens(task, states, input, hw_token_placeholder: str = None):
         json_line_copy = copy.deepcopy(json_line_i)
         if hw_token_placeholder:
             # 推理时与训练 text_student 保持一致：
-            # 1) 用占位符替换 target 字符串
-            # 2) 清空硬件参数数组，避免 8 个整数残留在文本中
+            # 用占位符替换 target 字符串，但保留硬件整数约束
             try:
                 json_line_copy[0][1] = hw_token_placeholder
-            except Exception:
-                pass
-            try:
-                json_line_copy[0][2] = []
             except Exception:
                 pass
         data = {}

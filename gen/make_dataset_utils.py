@@ -81,10 +81,6 @@ def json_to_token(
             student_struct = copy.deepcopy(teacher_struct)
             try:
                 student_struct[1][0][1] = hw_token_placeholder
-                try:
-                    student_struct[1][0][2] = []
-                except Exception:
-                    pass
             except Exception:
                 # 如果结构与预期不符，则跳过 student 文本
                 student_struct = None

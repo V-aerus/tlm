@@ -21,6 +21,8 @@ import shutil
 import sys
 import glob
 from typing import Optional
+import logging
+import sys
 
 # MoSLoRA integration: ensure the local customized PEFT is importable
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,8 +49,68 @@ from modeling import (
     FrozenBaseWrapper,
     GatedLoRAExpert,
     PeftDeltaWrapper,
-    ProtoMixAligner,
+ProtoMixAligner,
 )
+
+# 全局日志文件路径，由 main 设置
+LOG_FILE_PATH = None
+
+
+def log_debug(msg: str):
+    """简易日志写文件，避免 logging 配置在多进程失效。"""
+    if LOG_FILE_PATH:
+        try:
+            with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+def diagnose_state_failure(worker_id, workload_key, debug_ctx):
+    """
+    当 TVM 报告 “All states are invalid” 时打印调试信息。
+    debug_ctx 可能包含：
+      - last_input_json: str
+      - last_states_json: List[str]
+      - last_prompts: List[str]
+      - last_generations: List[str]
+      - hw_info: str
+    """
+    try:
+        hw_info = debug_ctx.get("hw_info")
+        log_debug("\n" + "=" * 80)
+        log_debug(f"[DEBUG][Worker {worker_id}] TVM rejected all states for workload: {workload_key}")
+        if hw_info:
+            log_debug(f"[DEBUG] HW info: {hw_info}")
+        log_debug("=" * 80)
+
+        inp_json = debug_ctx.get("last_input_json")
+        if inp_json is not None:
+            log_debug("[DEBUG] Last MeasureInput.to_json():")
+            log_debug(inp_json)
+
+        states_json = debug_ctx.get("last_states_json") or []
+        if states_json:
+            log_debug(f"[DEBUG] Dumping {len(states_json)} state(s):")
+            for i, s in enumerate(states_json[:5]):
+                log_debug(f"  - state[{i}]: {s}")
+
+        prompts = debug_ctx.get("last_prompts") or []
+        if prompts:
+            log_debug(f"[DEBUG] Dumping {len(prompts)} LLM prompt(s):")
+            for i, p in enumerate(prompts[:5]):
+                log_debug(f"  --- prompt[{i}] ---")
+                log_debug(p)
+
+        generations = debug_ctx.get("last_generations") or []
+        if generations:
+            log_debug(f"[DEBUG] Dumping {len(generations)} LLM generation(s):")
+            for i, g in enumerate(generations[:5]):
+                log_debug(f"  --- generation[{i}] ---")
+                log_debug(g)
+
+        log_debug("=" * 80 + "\n")
+    except Exception as e:
+        log_debug(f"[DEBUG] diagnose_state_failure raised error: {e}")
 
 
 def find_subsequence(seq: List[int], pattern: List[int]) -> int:
@@ -60,6 +122,37 @@ def find_subsequence(seq: List[int], pattern: List[int]) -> int:
         if seq[i : i + m] == pattern:
             return i
     return -1
+
+
+def generate_with_embeds_greedy(model, embed_layer, embeds, attention_mask, max_new_tokens, eos_token_id=None):
+    """
+    绕过 PeftModel.generate(inputs_embeds=...) 的潜在问题，手写最简单的 greedy 解码。
+    embeds: (B, L, D), attention_mask: (B, L)
+    返回: (B, T_new) 的 token id 张量（只包含新生成部分）
+    """
+    device = embeds.device
+    B = embeds.size(0)
+    generated = []
+    cur_embeds = embeds
+    cur_attn = attention_mask
+
+    for _ in range(max_new_tokens):
+        outputs = model(inputs_embeds=cur_embeds, attention_mask=cur_attn)
+        logits = outputs.logits[:, -1, :]  # (B, vocab)
+        next_ids = torch.argmax(logits, dim=-1)  # (B,)
+        generated.append(next_ids)
+
+        if eos_token_id is not None and (next_ids == eos_token_id).all():
+            break
+
+        next_embeds = embed_layer(next_ids.unsqueeze(1))  # (B,1,D)
+        cur_embeds = torch.cat([cur_embeds, next_embeds], dim=1)
+        next_attn = torch.ones((B, 1), dtype=cur_attn.dtype, device=device)
+        cur_attn = torch.cat([cur_attn, next_attn], dim=1)
+
+    if not generated:
+        return torch.zeros((B, 0), dtype=torch.long, device=device)
+    return torch.stack(generated, dim=1)
 
 
 @dataclass
@@ -75,18 +168,22 @@ class ScriptArguments:
     adapter_path: str = field(default=None, metadata={"help": "Path to a single LoRA/MoSLORA adapter (PEFT)"})
     multi_adapter_dir: str = field(default=None, metadata={"help": "Path to directory containing multiple HA/HS adapter files"})
     edge_expert_dirs: str = field(default=None, metadata={"help": "Comma-separated directories containing EdgeTLM experts"})
-    edge_embedding_path: str = field(default="Embedding/hardware_embeddings_v2.json", metadata={"help": "Hardware embedding json path"})
+    edge_embedding_path: str = field(default="Embedding/hardware_embeddings_v3.json", metadata={"help": "Hardware embedding json path"})
     edge_topk: int = field(default=1, metadata={"help": "Top-K experts to activate during inference"})
     
     # 硬件路由参数
     target_hardware: str = field(default=None, metadata={"help": "Target hardware type for MT-MoSLoRA (e.g., v100, xavier, i7)"})
     hw_injection: bool = field(default=False, metadata={"help": "Enable HwToken injection"})
     hw_aligner_path: str = field(default=None, metadata={"help": "Path to ProtoMix aligner checkpoint"})
+    hw_regressor_path: str = field(default=None, metadata={"help": "Optional regressor ckpt to map hw_emb -> embedding (bypass aligner)"})
+    hw_prototype_path: str = field(default=None, metadata={"help": "Optional prototype embedding pt (precomputed), bypass aligner/regressor"})
+    hw_name: str = field(default=None, metadata={"help": "Hardware name used to lookup prototype embedding (e.g., nvidia/nvidia-a40)"})
     hw_token: str = field(default="[MASK]", metadata={"help": "Token placeholder used for hardware injection"})
 
     # device: str = field(default="cuda:0", metadata={"help": ""})
     allow_repeat: bool = field(default=True, metadata={"help": ""})
     is_build: bool = field(default=False, metadata={"help": ""})
+    debug_only_generate: bool = field(default=False, metadata={"help": "仅调 gen_func 观察生成结果，不走 TVM gen_states/measure"})
 
 
 def gen_func(task, states, input, tokenizer, model, device, gen_kwargs, hw_injection_ctx=None):
@@ -96,6 +193,7 @@ def gen_func(task, states, input, tokenizer, model, device, gen_kwargs, hw_injec
     tokens = input_to_tokens(task, states, input, hw_token_placeholder=hw_placeholder)
     tokenizer.padding_side = "left"
     try:
+        # 保持与原版 gen_state.py 一致：使用默认 special token 行为
         batch = tokenizer(tokens, padding=True, max_length=None)
     except Exception as e:
         print(e)
@@ -112,14 +210,19 @@ def gen_func(task, states, input, tokenizer, model, device, gen_kwargs, hw_injec
             input_ids = torch.tensor(input_ids_all[start : start + batch_size], dtype=torch.long, device=device)
             attention_mask = torch.tensor(attention_mask_all[start : start + batch_size], dtype=torch.long, device=device)
 
+            # 与原版保持一致的长度裁剪
+            prompt_len = input_ids.shape[-1] - 1  # 去掉最后一个 special token
             input_ids = input_ids[:, :-1]
             attention_mask = attention_mask[:, :-1]
-            gen_kwargs['max_new_tokens'] = min(gen_kwargs['max_new_tokens'], tokenizer.model_max_length - input_ids.shape[-1])
+            allowed = tokenizer.model_max_length - input_ids.shape[-1]
+            if allowed < 1:
+                allowed = 1
+            gen_kwargs["max_new_tokens"] = min(gen_kwargs.get("max_new_tokens", 16), allowed)
+            gen_kwargs["max_new_tokens"] = max(gen_kwargs["max_new_tokens"], 1)
 
+            # 若有多 MASK，占位符后截断 prompt，强制从 MASK 后生成
             if hw_injection_ctx:
-                embeds = embed_layer(input_ids)
                 hw_token_ids = hw_injection_ctx["hw_token_ids"]
-                batch_hw = hw_injection_ctx["hw_vec"].unsqueeze(0).expand(input_ids.size(0), -1)
                 if len(hw_token_ids) > 1:
                     span_positions = []
                     for i in range(input_ids.size(0)):
@@ -127,26 +230,39 @@ def gen_func(task, states, input, tokenizer, model, device, gen_kwargs, hw_injec
                         if pos < 0 or pos + len(hw_token_ids) > input_ids.size(1):
                             raise ValueError("HwToken span not found or truncated in prompt")
                         span_positions.append(pos)
-                    hw_embed = hw_injection_ctx["aligner"](batch_hw, split_heads=True)  # (B,4,D)
-                    if hw_embed.size(1) != len(hw_token_ids):
-                        raise ValueError(
-                            f"Aligner output heads ({hw_embed.size(1)}) != hw_token length ({len(hw_token_ids)})"
-                        )
-                    for i, pos in enumerate(span_positions):
-                        embeds[i, pos : pos + len(hw_token_ids), :] = hw_embed[i]
-                else:
-                    hw_mask = (input_ids == hw_injection_ctx["hw_token_ids"][0])  # (B, L)
-                    if not torch.all(hw_mask.any(dim=1)):
-                        raise ValueError("HwToken injection requires placeholder token in every prompt")
-                    hw_embed = hw_injection_ctx["aligner"](batch_hw)
-                    embeds = torch.where(hw_mask.unsqueeze(-1), hw_embed.unsqueeze(1), embeds)
-                response = model.generate(inputs_embeds=embeds, attention_mask=attention_mask, **gen_kwargs)
+                    cut_len = span_positions[0] + len(hw_token_ids)
+                    input_ids = input_ids[:, :cut_len]
+                    attention_mask = attention_mask[:, :cut_len]
+                    prompt_len = input_ids.shape[-1]
+
+            if hw_injection_ctx:
+                # 用手写 greedy 解码，绕过 PEFT+inputs_embeds 的潜在问题
+                embeds = embed_layer(input_ids)
+                gen_ids = generate_with_embeds_greedy(
+                    model,
+                    embed_layer,
+                    embeds,
+                    attention_mask,
+                    gen_kwargs.get("max_new_tokens", 16),
+                    eos_token_id=tokenizer.eos_token_id,
+                )
             else:
                 response = model.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
+                gen_ids = response[:, prompt_len:]
 
-            response = response[:, input_ids.shape[-1]:]
-            response_list.extend(response.tolist())
-    return [tokenizer.batch_decode(item) for item in response_list]
+            try:
+                log_debug(f"[GEN-DEBUG] gen_sequences shape={list(gen_ids.shape)} (prompt_len={prompt_len})")
+            except Exception:
+                pass
+            gen_ids_list = gen_ids.cpu().tolist()
+            for ids in gen_ids_list:
+                if len(ids) == 0:
+                    # 跳过空生成，避免传递无效记录到 TVM
+                    continue
+                # 返回 token 级别列表，符合 TVM 期望的 Array[Array[String]]
+                toks = tokenizer.convert_ids_to_tokens(ids)
+                response_list.append(toks)
+    return response_list
 
 
 def extract_hardware_id_from_target(target) -> str:
@@ -206,30 +322,88 @@ def resolve_hw_embedding(hardware_id: str, embeddings: Dict[str, List[float]]) -
 
 
 def prepare_hw_injection_context(cfg, tokenizer, model, device):
-    ckpt = torch.load(cfg["aligner_path"], map_location=device)
-    proto = torch.tensor(ckpt["prototype_keys"], dtype=torch.float32, device=device)
-    embed_layer = model.get_input_embeddings()
-    embed_dim = ckpt.get("embed_dim", embed_layer.embedding_dim)
-    cfg_meta = ckpt.get("config", {})
-    temperature = cfg_meta.get("temperature", ckpt.get("temperature", 1.0))
-    trainable_temp = cfg_meta.get("trainable_temperature", False)
-    aligner = ProtoMixAligner(proto, embed_dim=embed_dim, temperature=temperature, trainable_temperature=trainable_temp)
-    aligner.load_state_dict(ckpt["state_dict"])
-    aligner.to(device)
-    aligner.eval()
+    # 优先使用预计算的 prototype
+    proto_path = cfg.get("hw_prototype_path")
+    if proto_path:
+        ck = torch.load(proto_path, map_location=device)
+        hw_name = cfg.get("hw_name")
+        if not hw_name or hw_name not in ck:
+            raise ValueError(f"hw_name '{hw_name}' not found in prototype file")
+        segs = ck[hw_name]
+        vectors = []
+        for seg in ["arch", "mem", "cons", "host"]:
+            info = segs.get(seg, {})
+            if not info.get("active", False):
+                # 对 inactive 的段，用全零向量占位，保证长度一致
+                vec_dim = next((v.get("vec").shape[-1] for v in segs.values() if v.get("active", False)), None)
+                if vec_dim is None:
+                    raise ValueError(f"No active segments found in prototype for {hw_name}")
+                vectors.append(torch.zeros(vec_dim, device=device))
+            else:
+                vectors.append(info["vec"].to(device))
+        hw_vec = torch.stack(vectors, dim=0)  # (4, D)
+        hw_token = cfg.get("hw_token", "[MASK]")
+        hw_token_ids = tokenizer(hw_token, add_special_tokens=False)["input_ids"]
+        if len(hw_token_ids) != hw_vec.size(0):
+            raise ValueError(f"hw_token length {len(hw_token_ids)} != prototype vec count {hw_vec.size(0)}")
+        return {
+            "mode": "prototype",
+            "hw_vec_proto": hw_vec,  # (4,D)
+            "hw_vec": torch.tensor(cfg["hw_vec"], dtype=torch.float32, device=device),  # 仍保留原始 hw_vec 以备需要
+            "hw_token_ids": hw_token_ids,
+            "placeholder": hw_token,
+            "patch_embedding": True,
+        }
 
-    hw_token = cfg.get("hw_token", ckpt.get("hw_token", "[MASK]"))
+    reg_path = cfg.get("hw_regressor_path")
+    hw_token = cfg.get("hw_token", "[MASK]")
     hw_token_ids = tokenizer(hw_token, add_special_tokens=False)["input_ids"]
     if not hw_token_ids:
         raise ValueError(f"Tokenizer failed to tokenize hw_token '{hw_token}'")
-
-    hw_vec = torch.tensor(cfg["hw_vec"], dtype=torch.float32, device=device)
-    return {
-        "aligner": aligner,
-        "hw_vec": hw_vec,
-        "hw_token_ids": hw_token_ids,
-        "placeholder": hw_token,
-    }
+    if reg_path:
+        hw_vec = torch.tensor(cfg["hw_vec"], dtype=torch.float32, device=device)
+        ck_reg = torch.load(reg_path, map_location=device)
+        in_dim, out_dim = ck_reg["in_dim"], ck_reg["out_dim"]
+        hidden = ck_reg.get("hidden", 256)
+        reg = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, hidden),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden, out_dim),
+        ).to(device)
+        state = ck_reg["state_dict"]
+        if any(k.startswith("net.") for k in state.keys()):
+            state = {k.replace("net.", ""): v for k, v in state.items()}
+        reg.load_state_dict(state, strict=False)
+        reg.eval()
+        return {
+            "mode": "regressor",
+            "regressor": reg,
+            "hw_vec": hw_vec,
+            "hw_token_ids": hw_token_ids,
+            "placeholder": hw_token,
+            "patch_embedding": True,
+        }
+    else:
+        ckpt = torch.load(cfg["aligner_path"], map_location=device)
+        proto = torch.tensor(ckpt["prototype_keys"], dtype=torch.float32, device=device)
+        embed_layer = model.get_input_embeddings()
+        embed_dim = ckpt.get("embed_dim", embed_layer.embedding_dim)
+        cfg_meta = ckpt.get("config", {})
+        temperature = cfg_meta.get("temperature", ckpt.get("temperature", 1.0))
+        trainable_temp = cfg_meta.get("trainable_temperature", False)
+        aligner = ProtoMixAligner(proto, embed_dim=embed_dim, temperature=temperature, trainable_temperature=trainable_temp)
+        aligner.load_state_dict(ckpt["state_dict"])
+        aligner.to(device)
+        aligner.eval()
+        hw_vec = torch.tensor(cfg["hw_vec"], dtype=torch.float32, device=device)
+        return {
+            "mode": "aligner",
+            "aligner": aligner,
+            "hw_vec": hw_vec,
+            "hw_token_ids": hw_token_ids,
+            "placeholder": hw_token,
+            "patch_embedding": True,
+        }
 
 
 def load_model_for_inference(args: ScriptArguments) -> tuple:
@@ -634,8 +808,12 @@ def merge_json_files_safely(tmp_folder, save_path):
         raise
 
 
-def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_path, multi_adapter_dir, target_hardware, original_target, device, allow_repeat, keep_cnt, is_build, worker_id, num_workers, hw_injection_cfg=None):
+def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_path, multi_adapter_dir, target_hardware, original_target, device, allow_repeat, keep_cnt, is_build, worker_id, num_workers, hw_injection_cfg=None, log_file_path=None, debug_only_generate=False):
     try:
+        # 子进程内设置 logging（追加同一个文件）
+        global LOG_FILE_PATH
+        if log_file_path:
+            LOG_FILE_PATH = log_file_path
         # <<< 新增的TVM初始化代码 >>>
         print(f"Initializing TVM environment in worker for target: {original_target}")
         register_data_path(original_target)
@@ -656,7 +834,8 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
             hw_aligner_path=hw_injection_cfg["aligner_path"] if hw_injection_cfg else None,
             hw_token=hw_injection_cfg["hw_token"] if hw_injection_cfg else "[MASK]",
             allow_repeat=allow_repeat,
-            is_build=is_build
+            is_build=is_build,
+            debug_only_generate=debug_only_generate,
         )
         
         # 使用集中的模型加载函数
@@ -674,6 +853,33 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
         hw_injection_ctx = None
         if hw_injection_cfg:
             hw_injection_ctx = prepare_hw_injection_context(hw_injection_cfg, tokenizer, model, device)
+            # 预先将 HwToken 对应的 embedding 覆盖为 aligner/regressor 输出，避免 inputs_embeds 路径
+            if hw_injection_ctx.get("patch_embedding", False):
+                with torch.no_grad():
+                    hw_token_ids = hw_injection_ctx["hw_token_ids"]
+                    if hw_injection_ctx["mode"] == "prototype":
+                        hw_embed = hw_injection_ctx["hw_vec_proto"].unsqueeze(0)  # (1,4,D)
+                    else:
+                        hw_vec_tensor = hw_injection_ctx["hw_vec"].unsqueeze(0)
+                        if hw_injection_ctx["mode"] == "regressor":
+                            hw_embed = hw_injection_ctx["regressor"](hw_vec_tensor)  # (1, D)
+                            hw_embed = hw_embed.unsqueeze(1).expand(-1, len(hw_token_ids), -1)  # (1, T, D)
+                        else:
+                            if len(hw_token_ids) > 1:
+                                hw_embed = hw_injection_ctx["aligner"](hw_vec_tensor, split_heads=True)  # (1, T, D)
+                            else:
+                                hw_embed = hw_injection_ctx["aligner"](hw_vec_tensor)
+                                hw_embed = hw_embed.unsqueeze(1)
+                    if hw_embed.size(1) != len(hw_token_ids):
+                        raise ValueError(
+                            f"Aligner/regressor output heads ({hw_embed.size(1)}) != hw_token length ({len(hw_token_ids)})"
+                        )
+                    emb_weight = model.get_input_embeddings().weight
+                    alpha = 0.3  # residual blend ratio
+                    for idx, tok_id in enumerate(hw_token_ids):
+                        orig = emb_weight.data[tok_id]
+                        emb_weight.data[tok_id] = (1 - alpha) * orig + alpha * hw_embed[0, idx].to(device)
+                    log_debug(f"[PATCH] Residual-patched embedding rows for hw tokens: {hw_token_ids}, alpha={alpha}")
         builder = auto_scheduler.measure.LocalBuilder(timeout=30)
         if os.path.exists(save_path_i):
             # tag = input(script_args.save_path + ' exist, delete it? [n]')
@@ -717,10 +923,55 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
         
         for workload_idx, (workload_key, inputs) in enumerate(tqdm.tqdm(my_sketch_chunk, desc=f"Worker {worker_id}")):
             try:
+                debug_ctx = {
+                    "last_input_json": None,
+                    "last_states_json": None,
+                    "last_prompts": None,
+                    "last_generations": None,
+                    "hw_info": target_hardware,
+                }
+
+                # Debug 分支：仅调用 gen_func 观察输出，不走 TVM gen_states/measure
+                if hw_injection_cfg is not None and getattr(script_args, "debug_only_generate", False):
+                    states_dbg = [inp.state for inp in inputs][:1]
+                    gens = gen_func(
+                        inputs[0].task,
+                        states_dbg,
+                        inputs[0],
+                        tokenizer,
+                        model,
+                        device,
+                        {"max_new_tokens": 16},
+                        hw_injection_ctx=hw_injection_ctx,
+                    )
+                    log_debug(f"[DEBUG-ONLY] workload={workload_key} gen_func output: {gens[:1]}")
+                    continue
+
                 def gen_func_inner(task, states, max_new_tokens):
                     max_new_tokens = max(max_new_tokens, 1)
                     gen_kwargs["max_new_tokens"] = max_new_tokens
-                    return gen_func(task, states, inputs[0], tokenizer, model, device, gen_kwargs, hw_injection_ctx=hw_injection_ctx)
+                    try:
+                        debug_ctx["last_input_json"] = inputs[0].to_json()
+                    except Exception:
+                        debug_ctx["last_input_json"] = None
+                    try:
+                        debug_ctx["last_states_json"] = [s.to_json() for s in states]
+                    except Exception:
+                        debug_ctx["last_states_json"] = [str(s) for s in states]
+                    try:
+                        prompts = input_to_tokens(
+                            task,
+                            states,
+                            inputs[0],
+                            hw_token_placeholder=hw_injection_ctx["placeholder"] if hw_injection_ctx else None,
+                        )
+                        debug_ctx["last_prompts"] = prompts
+                    except Exception:
+                        debug_ctx["last_prompts"] = None
+
+                    generations = gen_func(task, states, inputs[0], tokenizer, model, device, gen_kwargs, hw_injection_ctx=hw_injection_ctx)
+                    debug_ctx["last_generations"] = generations
+                    return generations
 
                 policy = auto_scheduler.SketchPolicy(inputs[0].task)
                 measure_inputs = []
@@ -734,8 +985,11 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
                 while retry_i < 5:
                     try:
                         all_state_list = policy.gen_states([inp.state for inp in inputs], gen_func_inner)
-                        # measure_inputs_cnt_before = len(measure_inputs)
-
+                        if not all_state_list:
+                            log_debug(f"Worker {worker_id}: workload {workload_key} gen_states returned empty list")
+                            diagnose_state_failure(worker_id, workload_key, debug_ctx)
+                            retry_i += 1
+                            continue
                         measure_inputs_tmp = []
                         for state in all_state_list:
                             inp = auto_scheduler.MeasureInput(inputs[0].task, state)
@@ -748,6 +1002,12 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
                             input_set.add(i_str)
                             measure_inputs_tmp.append(inp)
 
+                        if len(measure_inputs_tmp) == 0:
+                            log_debug(f"Worker {worker_id}: workload {workload_key} no measure_inputs generated")
+                            diagnose_state_failure(worker_id, workload_key, debug_ctx)
+                            retry_i += 1
+                            continue
+
                         default_build_result = auto_scheduler.measure.BuildResult(None, [], 0, None, 0)
                         if is_build:
                             build_results = builder.build(measure_inputs_tmp)
@@ -759,15 +1019,16 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
                                 measure_results.append(auto_scheduler.MeasureResult([0.0], 0, "", 0, time.time()))
 
                         retry_i += 1
-                        # measure_inputs_cnt_after = len(measure_inputs)
-                        # if measure_inputs_cnt_before == measure_inputs_cnt_after:
-                        #     retry_i += 1
-                        # else:
-                        #     retry_i = 0
                         if len(measure_inputs) >= keep_cnt:
                             break
                     except Exception as e:
-                        print(f"Worker {worker_id}: workload {workload_key} 第{retry_i+1}次重试时出错: {e}")
+                        import traceback
+                        msg = str(e)
+                        print(f"Worker {worker_id}: workload {workload_key} 第{retry_i+1}次重试时出错: {msg}")
+                        log_debug(msg)
+                        log_debug(traceback.format_exc())
+                        if "All states are invalid" in msg or "Internal error" in msg:
+                            diagnose_state_failure(worker_id, workload_key, debug_ctx)
                         retry_i += 1
                         if retry_i >= 5:
                             print(f"Worker {worker_id}: workload {workload_key} 重试5次后仍然失败，跳过")
@@ -830,20 +1091,22 @@ def main():
 
     hw_injection_cfg = None
     if script_args.hw_injection:
-        if not script_args.hw_aligner_path:
-            raise ValueError("--hw_injection requires --hw_aligner_path")
+        if not (script_args.hw_aligner_path or script_args.hw_regressor_path or script_args.hw_prototype_path):
+            raise ValueError("--hw_injection requires --hw_aligner_path or --hw_regressor_path or --hw_prototype_path")
         embeddings = load_hardware_embeddings(script_args.edge_embedding_path)
         hw_id = (script_args.target_hardware or extract_hardware_id_from_target(script_args.target)).lower()
         hw_name, hw_vec = resolve_hw_embedding(hw_id, embeddings)
         hw_injection_cfg = {
             "aligner_path": script_args.hw_aligner_path,
+            "hw_regressor_path": script_args.hw_regressor_path,
+            "hw_prototype_path": script_args.hw_prototype_path,
             "hw_vec": hw_vec,
             "hw_token": script_args.hw_token,
             "hw_name": hw_name,
         }
 
         # 若未显式指定 adapter_path，且对齐器 ckpt 所在目录包含 LoRA 适配器，则自动启用 LoRA（Mode B）
-        if script_args.adapter_path is None:
+        if script_args.adapter_path is None and script_args.hw_aligner_path:
             ckpt_dir = os.path.dirname(script_args.hw_aligner_path)
             adapter_file = os.path.join(ckpt_dir, "adapter_model.safetensors")
             if os.path.exists(adapter_file):
@@ -872,6 +1135,12 @@ def main():
     import tempfile
     tmp_folder = tempfile.mkdtemp(prefix=".gen_state_")
     err_queue = Queue()
+
+    # 设置日志写入文件（使用简单 file append，log_debug 会直接写）
+    log_file = os.path.join(os.path.dirname(script_args.save_path) or ".", "gen_state_debug.log")
+    global LOG_FILE_PATH
+    LOG_FILE_PATH = log_file
+    print(f"[DEBUG] Logging debug info to {log_file}")
     for gpu_i in range(num_gpus):
         save_path_i = f'{tmp_folder}/{gpu_i}_part'
         # filelist.append(save_path_i)
@@ -884,7 +1153,7 @@ def main():
         else:
             device = f'cuda:{gpu_i}'
             print(f"Worker {gpu_i}: 使用设备 {device}")
-        p = Process(target=worker, args=(err_queue, save_path_i, script_args.sketch_path, gen_kwargs, script_args.model_path, script_args.adapter_path, script_args.multi_adapter_dir, script_args.target_hardware, script_args.target, device, script_args.allow_repeat, script_args.keep_cnt, script_args.is_build, gpu_i, num_gpus, hw_injection_cfg))
+        p = Process(target=worker, args=(err_queue, save_path_i, script_args.sketch_path, gen_kwargs, script_args.model_path, script_args.adapter_path, script_args.multi_adapter_dir, script_args.target_hardware, script_args.target, device, script_args.allow_repeat, script_args.keep_cnt, script_args.is_build, gpu_i, num_gpus, hw_injection_cfg, log_file, script_args.debug_only_generate))
         p.start()
         processes.append(p)
     for p in processes:
