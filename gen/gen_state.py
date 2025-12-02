@@ -641,6 +641,44 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
         register_data_path(original_target)
         load_and_register_tasks()
         # <<< 结束新增代码 >>>
+
+        # 若记录中的 target 含有尾部 8 整数约束，先制作一份去掉尾段的临时副本供 TVM 解析
+        sketch_path_to_use = sketch_path
+        tmp_sanitized = None
+        need_sanitize = False
+        try:
+            with open(sketch_path, "r", encoding="utf-8") as fin:
+                first_line = fin.readline()
+                if first_line:
+                    obj = json.loads(first_line)
+                    tgt = obj.get("i", [None])[0][1] if isinstance(obj.get("i"), list) and len(obj["i"]) > 0 else None
+                    if isinstance(tgt, str) and " -1 " in tgt:
+                        need_sanitize = True
+        except Exception:
+            pass
+
+        if need_sanitize:
+            try:
+                import tempfile
+                fd, tmp_path = tempfile.mkstemp(prefix=".gen_state_sketch_", suffix=".json")
+                os.close(fd)
+                with open(sketch_path, "r", encoding="utf-8") as fin, open(tmp_path, "w", encoding="utf-8") as fout:
+                    for line in fin:
+                        try:
+                            obj = json.loads(line)
+                            tgt = obj.get("i", [None])[0][1] if isinstance(obj.get("i"), list) and len(obj["i"]) > 0 else None
+                            if isinstance(tgt, str) and " -1 " in tgt:
+                                obj["i"][0][1] = tgt.split(" -1 ")[0].strip()
+                                line = json.dumps(obj, separators=(",", ":")) + "\n"
+                        except Exception:
+                            # 解析失败则原样写回，避免中断
+                            pass
+                        fout.write(line)
+                sketch_path_to_use = tmp_path
+                tmp_sanitized = tmp_path
+                print(f"Worker {worker_id}: sanitized target strings for TVM parsing -> {sketch_path_to_use}")
+            except Exception as e:
+                print(f"Worker {worker_id}: sanitize sketch target failed, fallback to original. Error: {e}")
         
         # 在子进程中重新构建ScriptArguments对象
         script_args = ScriptArguments(
@@ -681,8 +719,8 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
             os.remove(save_path_i)
         
         # 3. 数据读取和分发 (新增/移动的代码)
-        print(f"Worker {worker_id}: Reading and processing sketches from {sketch_path}")
-        inputs, _ = auto_scheduler.RecordReader(sketch_path).read_lines()
+        print(f"Worker {worker_id}: Reading and processing sketches from {sketch_path_to_use}")
+        inputs, _ = auto_scheduler.RecordReader(sketch_path_to_use).read_lines()
         sketch_dic = {}
         inp_dic = {}
         for inp in tqdm.tqdm(inputs):
@@ -794,6 +832,11 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
                 continue
         
         print(f"Worker {worker_id}: 处理完成！成功处理 {successful_workloads}/{total_workloads} 个workload，共生成 {total_generated} 条记录")
+        if tmp_sanitized:
+            try:
+                os.remove(tmp_sanitized)
+            except Exception:
+                pass
     except Exception as e:
         err_queue.put(e)
 

@@ -183,7 +183,7 @@ def softmax(x, temperature=1.0):
     e_x = np.exp((x - np.max(x))/temperature)
     return e_x / e_x.sum(axis=0)
 
-def for_gen_eval_sketch(lines, keep_cnt, for_type):
+def for_gen_eval_sketch(lines, keep_cnt, for_type, canonical_target_override=None):
     input, _ = load_record_from_string(lines[0])
     task = auto_scheduler.measure.recover_measure_input(input).task
     compute_dag = task.compute_dag.print_min()
@@ -192,6 +192,13 @@ def for_gen_eval_sketch(lines, keep_cnt, for_type):
     json_line_dict = {}
     for line in lines:
         json_line = json.loads(line)
+        # 可选：覆盖 target 串
+        if canonical_target_override is not None:
+            try:
+                if isinstance(json_line["i"][0], list) and len(json_line["i"][0]) >= 2:
+                    json_line["i"][0][1] = canonical_target_override
+            except Exception:
+                pass
         steps = json_line["i"][1][1]
         ppt_idx = None
         for step_idx, step in enumerate(steps):
@@ -228,7 +235,10 @@ def for_gen_eval_sketch(lines, keep_cnt, for_type):
     latency_list = [latency_min / it for it in latency_list]
 
     probs = softmax(np.array(latency_list), temperature=0.3)
-    indices = np.random.choice(np.arange(len(latency_list)), size=keep_cnt, replace=True, p=probs)
+    sample_size = keep_cnt if keep_cnt is not None else len(latency_list)
+    indices = np.random.choice(np.arange(len(latency_list)), size=sample_size, replace=True, p=probs)
+    if np.isscalar(indices):
+        indices = [int(indices)]
 
     data_list = []
     for select_i in indices:
@@ -271,7 +281,7 @@ def input_to_tokens(task, states, input, hw_token_placeholder: str = None):
     return [item["text"] for item in json_to_token(data_list)]
 
 
-def process_file(args, tmp_folder, for_type, keep_cnt, hw_token_placeholder=None, hardware_embeddings=None, emit_hw_student=False):
+def process_file(args, tmp_folder, for_type, keep_cnt, hw_token_placeholder=None, hardware_embeddings=None, emit_hw_student=False, canonical_target_override=None):
     file_i, file = args
     print(file_i, end="    \r", flush=True)
     with open(file, "r") as f:
@@ -293,7 +303,7 @@ def process_file(args, tmp_folder, for_type, keep_cnt, hw_token_placeholder=None
             emit_hw_student=emit_hw_student,
         )
     elif for_type == FOR_GEN_EVAL_SKETCH or for_type == FOR_GEN_TRAIN_SKETCH or for_type == FOR_GEN_EVALTUNING_SKETCH or for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
-        data_list = for_gen_eval_sketch(lines, keep_cnt, for_type)
+        data_list = for_gen_eval_sketch(lines, keep_cnt, for_type, canonical_target_override=canonical_target_override)
     else:
         assert(False)
 
@@ -303,26 +313,45 @@ def process_file(args, tmp_folder, for_type, keep_cnt, hw_token_placeholder=None
             f.write("\n")
 
 
-def token_files_and_merge(for_type, files, save_path, keep_cnt=None, hw_token_placeholder=None, hardware_embeddings=None, emit_hw_student=False):
+def token_files_and_merge(for_type, files, save_path, keep_cnt=None, hw_token_placeholder=None, hardware_embeddings=None, emit_hw_student=False, canonical_target_override=None):
     os.makedirs(save_path, exist_ok=True)
     filename = f"{save_path}/0_merge.json"
     tmp_folder = f"{save_path}/0_tmp"
     if os.path.exists(tmp_folder):
         shutil.rmtree(tmp_folder)
     os.makedirs(tmp_folder)
-    with Pool(os.cpu_count()) as pool:
-        pool.map(
-            partial(
-                process_file,
+    use_mp = os.environ.get("NO_MP", "0") != "1"
+    if use_mp:
+        try:
+            with Pool(os.cpu_count()) as pool:
+                pool.map(
+                    partial(
+                        process_file,
+                        tmp_folder=tmp_folder,
+                        for_type=for_type,
+                        keep_cnt=keep_cnt,
+                        hw_token_placeholder=hw_token_placeholder,
+                        hardware_embeddings=hardware_embeddings,
+                        emit_hw_student=emit_hw_student,
+                        canonical_target_override=canonical_target_override,
+                    ),
+                    enumerate(files),
+                )
+        except PermissionError:
+            print("[WARN] Multiprocessing permission denied, fallback to single-process.")
+            use_mp = False
+    if not use_mp:
+        for item in enumerate(files):
+            process_file(
+                item,
                 tmp_folder=tmp_folder,
                 for_type=for_type,
                 keep_cnt=keep_cnt,
                 hw_token_placeholder=hw_token_placeholder,
                 hardware_embeddings=hardware_embeddings,
                 emit_hw_student=emit_hw_student,
-            ),
-            enumerate(files),
-        )
+                canonical_target_override=canonical_target_override,
+            )
     print()
     subprocess.run(f"cat {tmp_folder}/*_part > {filename}", shell=True)
     shutil.rmtree(tmp_folder)
@@ -334,11 +363,38 @@ def main():
     script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
     print(script_args)
 
+    def sanitize_4090_target(tgt: str) -> str:
+        """移除 4090 target 串末尾重复的 8 整数约束，避免与 i[0][2] 重复。"""
+        if not isinstance(tgt, str):
+            return tgt
+        low = tgt.lower()
+        if ("arch=sm_86" in low) or ("model=4090" in low) or (low.strip() in ["4090", "nvidia/nvidia-a40"]):
+            return tgt.split(" -1 ")[0].strip()
+        return tgt
+
     # Load task registry
     print("Load all tasks...")
     
-    # 智能映射multi target到具体硬件
+    # 智能映射 target 到具体硬件
     original_target = script_args.target
+    # 方便使用简写/硬件名时也能获得完整 4090 target 串
+    if script_args.target.lower() in ["4090", "nvidia/nvidia-a40"]:
+        script_args.target = (
+            "cuda -keys=cuda,gpu "
+            "-arch=sm_86 "
+            "-max_num_threads=1024 "
+            "-max_shared_memory_per_block=49152 "
+            "-max_threads_per_block=1024 "
+            "-registers_per_block=65536 "
+            "-thread_warp_size=32 "
+        )
+        script_args.target = sanitize_4090_target(script_args.target)
+    else:
+        script_args.target = sanitize_4090_target(script_args.target)
+
+    # 捕获字符串态的 target，供覆盖 canonical target 时使用
+    target_str_for_override = script_args.target
+
     if script_args.target.lower() == 'multi':
         # 从dataset_path中提取硬件名称
         dataset_path = script_args.dataset_path
@@ -347,7 +403,17 @@ def main():
         elif '/measure_records/xavier' in dataset_path:
             actual_target = 'nvidia/jetson-agx-xavier'
         elif '/measure_records/4090' in dataset_path:
-            actual_target = 'cuda -keys=cuda,gpu -arch=sm_86 -max_num_threads=1024 -model=4090 -thread_warp_size=32'
+            # 让 4090 的 target 串结构与 v100 保持一致，仅 arch 不同
+            actual_target = (
+                "cuda -keys=cuda,gpu "
+                "-arch=sm_86 "
+                "-max_num_threads=1024 "
+                "-max_shared_memory_per_block=49152 "
+                "-max_threads_per_block=1024 "
+                "-registers_per_block=65536 "
+                "-thread_warp_size=32 "
+            )
+            actual_target = sanitize_4090_target(actual_target)
         elif '/measure_records/xeon' in dataset_path:
             actual_target = 'llvm -mcpu=skylake-avx512 -model=xeon'
         else:
@@ -359,11 +425,28 @@ def main():
         
         # 使用multi作为网络信息路径，但actual_target作为TVM target
         register_data_path('multi')  # 强制使用multi的网络信息
-        script_args.target = tvm.target.Target(actual_target)
+        target_str_for_override = actual_target
+        # tvm.Target 不接受尾部 8 整数约束，构造 TVM target 时去掉整数段
+        actual_target_tvm = actual_target.split(" -1 ")[0].strip()
+        script_args.target = tvm.target.Target(actual_target_tvm)
     else:
-        register_data_path(script_args.target)
-        script_args.target = tvm.target.Target(script_args.target)
+        # register_data_path 依赖字符串里包含硬件别名，优先使用原始入参以避免被展开后丢失型号信息
+        register_target_hint = original_target if isinstance(original_target, str) else script_args.target
+        register_data_path(register_target_hint)
+        target_for_tvm = script_args.target.split(" -1 ")[0].strip()
+        script_args.target = tvm.target.Target(target_for_tvm)
     
+    # 针对 sketch 生成，允许覆盖记录中的 target 串
+    canonical_target_override = None
+    if script_args.for_type in (
+        FOR_GEN_EVAL_SKETCH,
+        FOR_GEN_TRAIN_SKETCH,
+        FOR_GEN_EVALTUNING_SKETCH,
+        FOR_GEN_EVAL_SKETCH_ONLY_BERT,
+    ):
+        if isinstance(target_str_for_override, str) and "cuda -keys" in target_str_for_override:
+            canonical_target_override = target_str_for_override.strip()
+
     tasks = load_and_register_tasks()
 
     hardware_embeddings = None
@@ -411,6 +494,7 @@ def main():
             hw_token_placeholder=hw_token_placeholder,
             hardware_embeddings=hardware_embeddings,
             emit_hw_student=script_args.emit_hw_student,
+            canonical_target_override=canonical_target_override,
         )
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type))
     elif script_args.for_type == FOR_LATENCY:
@@ -427,7 +511,15 @@ def main():
             set_seed(0)
             files = random.sample(files, script_args.file_cnt)
             print("Sampled file cnt:", len(files))
-        filename = token_files_and_merge(script_args.for_type, files, script_args.save_path)
+        filename = token_files_and_merge(
+            script_args.for_type,
+            files,
+            script_args.save_path,
+            hw_token_placeholder=hw_token_placeholder,
+            hardware_embeddings=hardware_embeddings,
+            emit_hw_student=script_args.emit_hw_student,
+            canonical_target_override=canonical_target_override,
+        )
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type))
     elif script_args.for_type == FOR_GEN_BEST:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
@@ -457,6 +549,7 @@ def main():
             hw_token_placeholder=hw_token_placeholder,
             hardware_embeddings=hardware_embeddings,
             emit_hw_student=script_args.emit_hw_student,
+            canonical_target_override=canonical_target_override,
         )
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type), valid_percentage=0)
     elif script_args.for_type == FOR_GEN_BEST_ALL:
@@ -471,6 +564,7 @@ def main():
             hw_token_placeholder=hw_token_placeholder,
             hardware_embeddings=hardware_embeddings,
             emit_hw_student=script_args.emit_hw_student,
+            canonical_target_override=canonical_target_override,
         )
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type), valid_percentage=0)
     elif script_args.for_type == FOR_GEN_EVAL_SKETCH or script_args.for_type == FOR_GEN_EVALTUNING_SKETCH or script_args.for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
@@ -485,11 +579,25 @@ def main():
         hold_out_set = set()
         for file in hold_out_files:
             hold_out_set.add(os.path.basename(file))
-        files_new = []
-        for file in files:
-            if os.path.basename(file) in hold_out_set:
-                files_new.append(file)
-        files = files_new
+        def _normalize_name(fname: str) -> str:
+            """去掉可能的硬件前缀（如 4090_）后再比较 basename。"""
+            base = os.path.basename(fname)
+            pos = base.find('([')
+            return base[pos:] if pos > 0 else base
+        hold_out_set_normalized = {_normalize_name(f) for f in hold_out_files}
+        # 兼容旧逻辑：ONLY_BERT 仅保留 bert hold-out；其他模式移除 hold-out
+        if script_args.for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
+            files_new = []
+            for file in files:
+                # 优先匹配去前缀名称；若不匹配，尝试去掉硬件前缀直接与原始 hold-out 名称比对
+                norm = _normalize_name(file)
+                base = os.path.basename(file)
+                if norm in hold_out_set_normalized or base in hold_out_set:
+                    files_new.append(file)
+            files = files_new
+        else:
+            # 默认行为：过滤掉 hold-out 集合，保留其他文件。若 hold_out_set 为空，则保留全部。
+            files = [file for file in files if _normalize_name(file) not in hold_out_set_normalized]
         print("After hold out, file cnt:", len(files))
         if script_args.schedule_file_path:
             from task_sheduler import find_potential_files
@@ -503,6 +611,7 @@ def main():
             hw_token_placeholder=hw_token_placeholder,
             hardware_embeddings=hardware_embeddings,
             emit_hw_student=script_args.emit_hw_student,
+            canonical_target_override=canonical_target_override,
         )
     elif script_args.for_type == FOR_GEN_TRAIN_SKETCH:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
@@ -538,6 +647,7 @@ def main():
             hw_token_placeholder=hw_token_placeholder,
             hardware_embeddings=hardware_embeddings,
             emit_hw_student=script_args.emit_hw_student,
+            canonical_target_override=canonical_target_override,
         )
     else:
         assert(False)

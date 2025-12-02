@@ -18,12 +18,32 @@ def clean_name(x):
 
 def register_data_path(target_str):
     assert(isinstance(target_str, str))
-    model_list = ['i7', 'v100', 'a100', '2080', '4090', 'xavier', 'xeon', 'multi', 'None']
+    model_list = ['i7', 'v100', 'a100', '2080', '4090', '3090', 'xavier', 'xeon', 'multi', 'None']
+    alias_map = {
+        # 3090 直接复用 4090 的数据目录/网络信息
+        '3090': '4090',
+        'nvidia/nvidia-3090': '4090',
+    }
     model = 'None'
     for m in model_list:
         if m.lower() in target_str.lower():  # 忽略大小写，提高兼容性
             model = m
             break
+    if model == 'None':
+        # 兼容未显式带型号的 canonical target 串，依据 arch/mcpu 进行推断
+        ts = target_str.lower()
+        if "arch=sm_86" in ts:
+            model = "4090"
+        elif "arch=sm_80" in ts or "a100" in ts:
+            model = "a100"
+        elif "arch=sm_70" in ts:
+            model = "v100"
+        elif "arch=sm_72" in ts or "carmel" in ts:
+            model = "xavier"
+        elif "skylake-avx512" in ts or "mcpu=skylake" in ts:
+            model = "xeon"
+    # 将别名映射到实际目录
+    model = alias_map.get(model, model)
     assert(model != 'None')
 
     print(f'register data path: {model}')
