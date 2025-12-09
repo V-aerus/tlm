@@ -87,13 +87,20 @@ class ScriptArguments:
     # device: str = field(default="cuda:0", metadata={"help": ""})
     allow_repeat: bool = field(default=True, metadata={"help": ""})
     is_build: bool = field(default=False, metadata={"help": ""})
+    use_bucket: bool = field(default=False, metadata={"help": "If true, convert target to bucket tokens when forming text prompts"})
 
 
-def gen_func(task, states, input, tokenizer, model, device, gen_kwargs, hw_injection_ctx=None):
+def gen_func(task, states, input, tokenizer, model, device, gen_kwargs, hw_injection_ctx=None, use_bucket: bool = False):
     if len(states) == 0:
         return []
     hw_placeholder = hw_injection_ctx["placeholder"] if hw_injection_ctx else None
-    tokens = input_to_tokens(task, states, input, hw_token_placeholder=hw_placeholder)
+    tokens = input_to_tokens(
+        task,
+        states,
+        input,
+        hw_token_placeholder=hw_placeholder,
+        use_bucket=use_bucket,
+    )
     tokenizer.padding_side = "left"
     try:
         batch = tokenizer(tokens, padding=True, max_length=None)
@@ -634,7 +641,7 @@ def merge_json_files_safely(tmp_folder, save_path):
         raise
 
 
-def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_path, multi_adapter_dir, target_hardware, original_target, device, allow_repeat, keep_cnt, is_build, worker_id, num_workers, hw_injection_cfg=None):
+def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_path, multi_adapter_dir, target_hardware, original_target, device, allow_repeat, keep_cnt, is_build, worker_id, num_workers, hw_injection_cfg=None, use_bucket=False):
     try:
         # <<< 新增的TVM初始化代码 >>>
         print(f"Initializing TVM environment in worker for target: {original_target}")
@@ -758,7 +765,17 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
                 def gen_func_inner(task, states, max_new_tokens):
                     max_new_tokens = max(max_new_tokens, 1)
                     gen_kwargs["max_new_tokens"] = max_new_tokens
-                    return gen_func(task, states, inputs[0], tokenizer, model, device, gen_kwargs, hw_injection_ctx=hw_injection_ctx)
+                    return gen_func(
+                        task,
+                        states,
+                        inputs[0],
+                        tokenizer,
+                        model,
+                        device,
+                        gen_kwargs,
+                        hw_injection_ctx=hw_injection_ctx,
+                        use_bucket=use_bucket,
+                    )
 
                 policy = auto_scheduler.SketchPolicy(inputs[0].task)
                 measure_inputs = []
@@ -927,7 +944,28 @@ def main():
         else:
             device = f'cuda:{gpu_i}'
             print(f"Worker {gpu_i}: 使用设备 {device}")
-        p = Process(target=worker, args=(err_queue, save_path_i, script_args.sketch_path, gen_kwargs, script_args.model_path, script_args.adapter_path, script_args.multi_adapter_dir, script_args.target_hardware, script_args.target, device, script_args.allow_repeat, script_args.keep_cnt, script_args.is_build, gpu_i, num_gpus, hw_injection_cfg))
+        p = Process(
+            target=worker,
+            args=(
+                err_queue,
+                save_path_i,
+                script_args.sketch_path,
+                gen_kwargs,
+                script_args.model_path,
+                script_args.adapter_path,
+                script_args.multi_adapter_dir,
+                script_args.target_hardware,
+                script_args.target,
+                device,
+                script_args.allow_repeat,
+                script_args.keep_cnt,
+                script_args.is_build,
+                gpu_i,
+                num_gpus,
+                hw_injection_cfg,
+                script_args.use_bucket,
+            ),
+        )
         p.start()
         processes.append(p)
     for p in processes:

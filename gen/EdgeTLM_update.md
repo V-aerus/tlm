@@ -839,3 +839,228 @@ loss：λ_lm=1.0, λ_geom≈1.0, λ_orth=0.1, λ_cls=0.01, λ_kd=0；
   - 4-MASK + patch 注入的推理实验显示：虽然能生成 token，但语法被严重破坏，模型倾向复读硬件参数/数字，TVM 全部 invalid。
   - 离线检查 aligner 输出几何位置正常（与 prototype/target 余弦高），问题集中在 4-MASK 句法/解码习惯：替换硬件子句后，模型把硬件串当成续写，合法 schedule 稀缺。
   - 已试 embedding patch + greedy 解码绕过 HF+PEFT inputs_embeds bug，生成不再为空但仍不合法，提示需要在训练/掩码/提示格式上进一步调整（如更强的 schedule 监督、首 token 约束等）。
+
+
+
+12.2
+
+EdgeTLM 当前问题与目标简要回顾
+
+基础模型：OSDI’24 Tensor Language Model (TLM)，输入为「子图 + shape + TVM target 硬件串」，输出合法的 schedule DSL（SP/FSP/AN/RE/CHR…）。
+
+现有能力：在训练过的硬件上，TLM-base 已经能稳定生成 TVM 可接受的 schedule（语法与性能都不错）。
+
+核心痛点：新硬件（OOV target） 无法直接用原始 target 串表示，一旦把新硬件的信息直接塞进 prompt，容易出现：
+
+词表 OOV / token 乱飞；
+
+生成结果被硬件字符串污染（大量 cuda/llvm 参数出现在 schedule 段），TVM 全部 invalid。
+
+我们的目标是：在 冻结 TLM-base 主体 的前提下，让模型能对未见过的硬件也生成语法合法、性能合理的 schedule。
+
+旧方案回顾：4×[MASK] + hw_aligner 的问题
+
+早期尝试：
+
+做法：用 4 个 [MASK] 替换整段硬件 target，训练一个 hw_aligner + LoRA 把连续硬件向量映射到这 4 个位置的 embedding，然后再交给 TLM-base 继续生成。
+
+问题：
+
+aligner 很快学成了「硬件 token 模拟器」，输出几乎完全落在硬件参数的 embedding 子空间；
+
+冻结的 TLM-base 会把这 4 个位置当作「强硬件提示」，继续在后续输出中补齐各种硬件串；
+
+结果 schedule 段被严重“硬件化”，TVM 侧全部 invalid。
+
+结论：直接用“覆盖硬件串 + 强行注入 embedding”的方式，会与 TLM 的预训练模式正面冲突，不适合作为长期方案。
+
+新方案概览：Bucket + KV Aligner（类 MPnP 设计）
+
+新的思路参考了多模态系统（例如 MPnP）中 “side-channel KV 对齐” 的做法，把问题拆成两条通道：
+
+文本通道（prompt）只保留粗粒度信息：硬件类型 bucket
+
+在 tokenizer 中新增少量 bucket token，例如：
+
+[HW_GPU_HPC]：高性能 GPU（V100/A40/4090/A100…）
+
+[HW_GPU_EDGE]：边缘 GPU（Jetson 等）
+
+[HW_CPU_X86]：服务器 CPU
+
+[HW_CPU_ARM]：ARM SoC
+
+对训练语料：
+
+text 字段保留完整的 canonical 硬件 target 串（给 teacher / baseline 用）；
+
+text_student 字段对容易 OOV 的字段做桶化，例如：
+
+-arch=sm_86 → -arch=[HW_GPU_HPC]
+
+其它关键字段如 cuda -keys=cuda,gpu、-max_num_threads=1024 暂时保留不动。
+
+这样，student 看到的是“带 bucket 的张量句子”，仍然有清晰的 CUDA/CPU 语法，只是 arch 这类 OOV 值被抽象成少数几类符号。
+
+硬件信息主通道：KV side-channel + 对齐器
+
+为每个硬件准备一个连续向量 hw_emb（由我们自己的硬件特征/聚类生成）。
+
+设计一个 HwKVAligner：
+
+输入：hw_emb ∈ R^d_hw；
+
+输出：若干个 K_hw, V_hw 向量（可以看作 T_hw 个“硬件 memory slot”）；
+
+在 TLM 后若干层的 self-attention 中，把这些 K_hw, V_hw 拼接到文本 K/V 后面，形成：
+
+Q：仍然来自文本 hidden states；
+
+K = [K_text; K_hw]，V = [V_text; V_hw]，并通过可学习 gate 控制硬件 KV 的影响强度。
+
+训练时仅更新 HwKVAligner + 少量深层 LoRA（以及 bucket embedding），TLM-base 主体保持冻结。
+
+直观理解：
+
+bucket 负责在文本侧告诉模型“这是一类什么硬件”（HPC GPU / EDGE GPU / CPU）；
+
+hw_emb + KV-aligner 在注意力空间中注入细粒度硬件差异（如 sm_70 vs sm_86、内存/warp 规模等）；
+
+schedule 的语法和主干预测模式仍然由原始 TLM 负责，不被大幅扰动。
+
+分阶段计划（简略版）
+
+Phase 0：Canonical 化硬件 target（填平语法坑）
+
+为 V100/A40/4090/Jetson/CPU 定义统一的 canonical target 模板；
+
+修改 make_dataset / gen_state，保证所有新生成的数据都使用 canonical target；
+
+对旧 4090 等“奇葩格式”样本做离线修补，验证 TLM-base 在 canonical 格式下 invalid 率仍然正常。
+
+Phase 1：扩展 bucket 词表 + 构造 bucket 版训练数据
+
+扩展 tokenizer / 模型词表，加入 [HW_*] bucket token，并用原始 arch token embedding 的平均值进行初始化；
+
+为每条样本保留：
+
+text：完整 canonical target（teacher 视角）；
+
+text_student：仅将 -arch= 等字段替换为对应 [HW_*]，其它字段保留（student 视角）；
+
+hw_emb：连续硬件表示，供 KV-aligner 使用。
+
+Stage 0：仅微调 bucket embedding（小规模 CLM/KD 预热）
+
+在 student 复制的模型上，使用 text_student 做一轮小规模 CLM/KD；
+
+只更新新加的 bucket embedding（及对应 lm_head 行），冻结其它参数；
+
+目标是让模型在“bucket 句子”输入下，行为尽量接近原始 TLM。
+
+Stage 1：训练 KV-aligner + 深层 LoRA
+
+在 Stage0 的 bucket-base 上挂上 HwKVAligner 和少量深层 LoRA；
+
+输入：text_student + hw_emb，teacher 仍然是原始 TLM（输入 text）；
+
+Loss 主要是 schedule 段的 LM CE + KD；
+
+只训练 KV-aligner、LoRA 和少量 bucket embedding，使模型在保持语法稳定的前提下，学会利用连续硬件信息进行 OOV 硬件迁移。
+
+这样分层之后，整个系统的职责划分更清晰：
+
+TLM-base：负责张量语言与 schedule 语法（尽量不动）；
+
+bucket token：解决 OOV、提供硬件类型级别的离散提示；
+
+KV-aligner + LoRA：桥接连续硬件向量与 TLM 的内部注意力空间，驱动新硬件上的 schedule 迁移与微调。
+
+[2025-12] Bucket 化硬件词表 + 数据构造链路重构（Phase 0.5）
+
+这一阶段，我们对 TLM 的数据构造链路做了一次“分层重构”，目的是：
+
+保证 TVM / AutoScheduler 侧始终使用 canonical 的硬件 target 字符串；
+
+只在 TLM 文本通道 上引入少量离散的“硬件桶（bucket）控制词”，为后续 KV side-channel + LoRA 专家路由做准备。
+
+具体修改如下：
+
+扩展 tokenizer / 模型词表，引入硬件 bucket token
+
+在原有 gen_tokenizer_multi_v1 的基础上，我们新增了 6 个 bucket token，并用已有硬件 token 的 embedding 做初始化：
+
+[HW_GPU_HPC]：高性能 GPU（V100 / A40 / 4090 等），初始化为 -arch=sm_70 和 -arch=sm_86 embedding 的平均；
+
+[HW_GPU_EDGE]：边缘/嵌入式 GPU（Jetson Xavier 等），初始化为 -arch=sm_72 embedding；
+
+[HW_CPU_X86]：x86 服务器 CPU（Xeon），初始化为 -mcpu=skylake-avx512 embedding；
+
+[HW_CPU_ARM]：ARM SoC（Jetson host / Raspberry Pi 等），初始化为 -mcpu=carmel embedding；
+
+[MODEL_CPU_SERVER]、[MODEL_GPU_CONSUMER]：预留给后续的 model 级 bucket。
+
+生成的新 tokenizer / 模型保存在：
+
+gen_tokenizer_multi_v1_bucket
+
+clm_gen_multi_v1_bucket_init
+
+统一 canonical target 语法，修正 4090 异常格式
+
+在 make_dataset.py 的 main() 中，我们为 4090 和 multi 平台补上了一套统一的 canonical target 模板：
+
+V100 / A40 / 4090：统一为
+cuda -keys=cuda,gpu -arch=sm_xx -max_num_threads=1024 -max_shared_memory_per_block=49152 -max_threads_per_block=1024 -registers_per_block=65536 -thread_warp_size=32
+
+Xeon：统一为
+llvm -mcpu=skylake-avx512 -model=xeon
+
+ARM/Jetson/Raspberry Pi 等后续硬件也会遵循类似规则（mcpu 统一 bucket 为 ARM）。
+
+所有 TVM 的 tvm.target.Target 对象都从这些 canonical 字符串构造，并在构造时去掉末尾重复的整数约束段，确保 AutoScheduler / TVM 解析稳定。
+
+引入 canonical_to_bucket：只在构造张量句子时做 bucket 重写
+
+在 make_dataset.py 中新增：
+
+canonical_to_bucket(target_str: str) -> str：
+只基于 canonical target 字符串中的 -arch / -mcpu 字段，做最小替换：
+
+sm_70 / sm_86 → [HW_GPU_HPC]
+
+sm_72 → [HW_GPU_EDGE]
+
+skylake-avx512 → [HW_CPU_X86]
+
+carmel → [HW_CPU_ARM]
+
+input_to_tokens(..., use_bucket: bool = False)：
+在将 task + state 转成 [compute_dag, json_line_i] 这种“张量句子”结构时：
+
+先用 str(task.target) 拿到 canonical target；
+
+若 use_bucket=True，则调用 canonical_to_bucket 把 arch/mcpu 替换成 bucket token；
+
+然后再把这个 target 写回 json_line_i[0][1]，只影响喂给 tokenizer 的文本，不影响 TVM 内部存储的 task.target。
+
+这意味着：
+
+AutoScheduler 的 JSON 记录和 TVM 解析的 target 始终是 canonical 形式；
+
+TLM 的输入句子可以在需要时看到 bucket 化后的 target 片段，例如：
+cuda -keys=cuda,gpu [HW_GPU_HPC] -max_num_threads=1024 ...；
+
+“硬件词表抽象（bucket）”被明确地限制在 TLM 文本通道这一层，不再反向污染 TVM。
+
+后续工作（展望）
+
+针对现有 4 个硬件，canonical_to_bucket 已经可以稳定地产生 bucket 化张量句子，用于后续的 bucket-base CLM 小微调；
+
+对于未来新硬件（树莓派 / 新 GPU 等），我们计划在硬件 embedding JSON 中维护 hardware_name → bucket 的显式映射，并通过一个 build_bucket_target(hw_bucket) 的 helper 直接生成 bucket 版 target 文本：
+
+TVM 仍然吃 canonical target；
+
+TLM 看到的则是 [HW_GPU_HPC] / [HW_CPU_ARM] 级别的抽象 + KV side-channel 注入的连续硬件 embedding。
+
+这套改造为下一阶段的 “bucket prompt + KV-aligner + 深层 LoRA 专家路由” 做好了铺垫，同时也保证了原始 TLM / TVM pipeline 的行为尽量保持不变，便于对比和回滚。

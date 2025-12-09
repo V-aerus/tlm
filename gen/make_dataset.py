@@ -250,11 +250,53 @@ def for_gen_eval_sketch(lines, keep_cnt, for_type, canonical_target_override=Non
     return data_list
 
 
-def input_to_tokens(task, states, input, hw_token_placeholder: str = None):
+def canonical_to_bucket(target_str: str) -> str:
+    """
+    将 canonical target 中的 arch/mcpu 片段替换为 bucket token，不改其他字段。
+    """
+    if not isinstance(target_str, str):
+        return target_str
+    # TODO(hhs, future):
+    #   This canonical_to_bucket() is a short-term, string-based heuristic for mapping
+    #   TVM canonical targets to bucket tokens (e.g., [-arch=sm_*] -> [HW_GPU_HPC/EDGE],
+    #   -mcpu=skylake-avx512/carmel/cortex-a* -> [HW_CPU_X86/ARM]).
+    #   In the long run, we should refactor this into a more explicit design:
+    #     - Maintain a hardware_bucket_map (hw_name -> bucket token) based on
+    #       hardware embeddings / clustering or a curated JSON mapping.
+    #     - Use a helper like build_bucket_target(hw_bucket) to construct the
+    #       bucket-style target string for TLM, instead of inferring buckets only
+    #       from "contains('-arch=sm_')" string patterns.
+    #   TVM should always consume canonical targets; bucket tokens are only for
+    #   the TLM text channel (input_to_tokens) and KV side-channel alignment.
+    tokens = target_str.split()
+    for i, tok in enumerate(tokens):
+        if tok.startswith("-arch=sm_"):
+            if tok.startswith("-arch=sm_72"):
+                tokens[i] = "[HW_GPU_EDGE]"
+            else:
+                tokens[i] = "[HW_GPU_HPC]"
+        if tok.startswith("-mcpu="):
+            if "skylake-avx512" in tok:
+                tokens[i] = "[HW_CPU_X86]"
+            elif "carmel" in tok or "cortex-a" in tok:
+                tokens[i] = "[HW_CPU_ARM]"
+    return " ".join(tokens)
+
+
+def input_to_tokens(task, states, input, hw_token_placeholder: str = None, use_bucket: bool = False):
     compute_dag = task.compute_dag.print_min()
     json_line_i = json.loads(input.to_json())
     workload_key = json_line_i[0][0]
     json_line_i[0][0] = json.loads(workload_key)
+
+    # 根据配置对 target 进行 bucket 化，仅影响 tokenizer 输入，不改原始记录
+    target_str = str(task.target)
+    if use_bucket:
+        target_str = canonical_to_bucket(target_str)
+    try:
+        json_line_i[0][1] = target_str
+    except Exception:
+        pass
 
     data_list = []
     for state in states:
