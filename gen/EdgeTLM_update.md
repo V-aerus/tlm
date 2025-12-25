@@ -1064,3 +1064,230 @@ TVM 仍然吃 canonical target；
 TLM 看到的则是 [HW_GPU_HPC] / [HW_CPU_ARM] 级别的抽象 + KV side-channel 注入的连续硬件 embedding。
 
 这套改造为下一阶段的 “bucket prompt + KV-aligner + 深层 LoRA 专家路由” 做好了铺垫，同时也保证了原始 TLM / TVM pipeline 的行为尽量保持不变，便于对比和回滚。
+
+[2025-12-11] Phase 1 落地：实现 HwKVAligner 硬件旁路注入
+1. 背景与动机
+在 Phase 0.5 中，我们确立了 "Text Channel (Bucket) + KV Side-Channel (Aligner)" 的双通道架构。此前的实验表明，直接在 Prompt 中进行 Token 级的硬件嵌入注入（4x[MASK] 替换）会严重破坏 TLM-Base 的张量语言（DSL）语法，导致 TVM Invalid 率飙升。
+
+本次更新旨在打通 KV Side-Channel，即通过在 Attention 层深处注入硬件信息，避免污染 Prompt 的句法结构，从而在保持 Base 语法稳定性的前提下，实现对新硬件特性的细粒度适配。
+
+2. 核心实现内容
+A. 硬件 KV 对齐器 (gen/hw_kv_aligner.py)
+
+架构参考：复用了 mPnP (LiDAR) 的设计范式，实现了 HwKVAligner 模块。
+
+数据流：
+
+输入：24 维连续硬件向量（来自 hardware_embedding_generator_v4）。
+
+投影：通过 MLP 将 24 维向量映射为 num_slots (默认 4) 个 Token 的 KV 形态。
+
+注入机制：仅在模型的最后 backward_depth (默认 4) 层生效。通过可学习的 linker_weights (Softmax 归一化) 控制每一层注入的强度。
+
+输出：生成兼容 HuggingFace 格式的 past_key_values，形状为 [2, B*beams, H, T_hw, d_head]，支持 Beam Search 复制。
+
+B. 推理链路集成 (gen/gen_state.py)
+
+解耦设计：改造了 prepare_hw_injection_context 和 gen_func。现在的推理链路支持解耦配置：
+
+仅使用 Bucket Token（文本通道）；
+
+仅使用 ProtoMix（旧 Token 注入，保留兼容性）；
+
+[新增] 仅使用 KV Injection（硬件旁路）；
+
+混合模式。
+
+无感接入：在 gen_func 中，若检测到 kv_aligner 存在，会自动构造 past_key_values 并传入 model.generate()。对于 Base 模型而言，这相当于“预先看到”了一段不存在于文本中的硬件上下文。
+
+C. 训练骨架 (train_hw_kv_aligner.py)
+
+建立了一个专门的训练脚本骨架，确立了 Frozen Base + Trainable Aligner 的训练模式。
+
+目前已打通 Forward/Backward 梯度链路，验证了 past_key_values 注入的可微性。
+
+3. 解决的问题
+语法保护：Prompt 仍然保持纯净的张量语言格式（仅含 Bucket Token），规避了 Token 注入导致的 DSL 语法崩坏问题。
+
+细粒度适配：Bucket Token ([HW_GPU_HPC]) 只能提供粗粒度的类别信息，而 HwKVAligner 引入的连续向量（如 sm_86 vs sm_89 的差异）通过 Cross-Attention 机制在深层影响生成策略，弥补了 Bucket 的精度损失。
+
+4. 下一步计划
+联调训练：将 train_hw_kv_aligner.py 接入真实的 EdgeTLM 数据集，使用 lat_lora_star 或 Schedule 合法性作为监督信号。
+
+超参探索：验证 num_slots=4 和 backward_depth=4 在 Tensor Program 生成任务上的最佳配置。
+
+LoRA 协同：在 KV Aligner 跑通后，尝试与深层 LoRA (Last-N layers) 联合训练，完成 Phase 1 的最终形态。
+
+KV 注入通路实现与调试记录（建议加入 update.md）
+0. 目标与基本设定
+
+目标： 在不改动/不重新训练 TLM-Base 的前提下，让模型在输入中接收“硬件条件”（尤其是新硬件/OOV 硬件），并能生成合法 schedule。我们采用两段式策略：
+
+Bucket（离散化硬件 token）：把硬件字符串映射到有限桶（如 [HW_GPU_HPC]），保证 tokenizer 不 OOV。
+
+KV 注入（连续硬件 embedding side-channel）：把硬件 embedding 通过一个小网络（HwKVAligner）映射成若干个 “prefix slots”的 past_key_values，在推理时注入到模型的 attention cache 中，从而提供更细粒度的硬件条件。
+
+最终希望形成 “bucket + KV” 的 base 通路；后续再叠加 LoRA 路由 承接“优化知识复用/迁移”。
+
+1. 推理侧实现里程碑：gen_state_debug_kv.py
+
+我们将推理脚本扩展为支持：
+
+--use_bucket：使用 bucket token 替换硬件字符串；
+
+--use_hw_kv / --hw_kv_mode {noop, zero, real}：
+
+noop：完全不走 KV 分支（baseline）
+
+zero：注入全 0 的 KV（用于隔离“位置/缓存/实现”问题）
+
+real：加载 HwKVAligner.pt + hardware_embeddings.json 注入真实 KV
+
+--hw_kv_num_slots N：prefix slots 数（常见 1/2/4）
+
+--pos_compensate：对 prefix_len 引入的“位置偏移”做补偿（关键）
+
+多个调试开关：--debug_forward_trace / --debug_manual_greedy_steps / --debug_logits_compare / --debug_kv_stats / --debug_prefill_equiv_kv 等
+
+同时实现了 KV 推理的核心逻辑：
+
+prefill + last-token generate：先把 prompt 的前缀做一次 prefill（结合 HW past），再拿最后一个 token 进入逐步生成，确保与 HF generate 的 cache 机制兼容。
+
+我们验证过：在 greedy 模式下，“直接 generate” 与 “prefill + last-token generate” 输出一致，说明这段拆分本身不是 bug 源头。
+
+2. 早期现象：KV 一开就掉 valid（甚至 zero KV 也掉）
+
+最典型症状：
+
+noop 模式：9/9 valid
+
+zero 或 real KV：经常掉到 4/9 valid（或 slot=2 时略有回升，例如 6/9）
+
+输出形式“看起来格式正确”，但数值约束（如 SPC 因子乘积 == 轴长度）不满足，被 TVM 判 invalid。
+
+这一步的重要结论是：不是 TVM 校验“太严格”，而是模型生成轨迹被扰动，导致数值更容易跑飞；尤其“zero KV 也掉 valid”强烈暗示问题不在 aligner 输出内容，而在KV 注入带来的位置/缓存处理。
+
+3. 排除项与关键定位过程（我们做过的实验链）
+3.1 不是 EOS / 不是长度预算不足
+
+加了日志检查 new_tokens/hit_limit/ended_with_eos，发现“短输出”主要是 max_new_tokens 截断（比如被内部传入的 34 卡死），并非 EOS 提前结束。
+
+增大 max_new_tokens 后输出会变长，但 invalid 仍会出现 → “短”不是根因。
+
+同时我们也澄清了一个误会：模型生成段（比如 34 tokens）并不等于最终 schedule 的全部，SketchPolicy 会基于 state 做后续扩展，最终 JSON 里会出现大量 FU/AN/SP/PRS/PR 等步骤。
+
+3.2 不是 “prefill 拆分” 的逻辑 bug
+
+增加 [PREFILL-EQUIV-KV] 对比：KV 模式下 full-forward 与 split-prefill 的 top1 一致 → prefill 拆分不是主要问题来源。
+
+3.3 核心定位：HF generate 的 position_ids 管理在 KV 场景下失效
+
+我们在 model.forward 入口加 trace，观察到：
+
+prefill 阶段显式传入了 position_ids（0..136）；
+
+进入 generate loop 后，position_ids 变成 None，模型内部按 past_len 自行重算位置；
+
+在 past_len>0（prefix_len=4）的情况下，这会把后续 token 的位置推进到错误的坐标系里，导致自回归轨迹逐步偏移，最终更容易生成 invalid 值。
+
+这一点还被“手写 greedy 对照实验”进一步证实：
+
+slots=4 + zero KV：手写 greedy 30 步，在第 14 步开始分叉
+
+slots=0：30 步完全 match
+
+slots=4 + pos_compensate(强制贯穿)：手写 greedy 30 步完全 match
+
+=> 结论：问题主要来自“HF generate 的后续步 position_ids 未按我们期望推进”，而不是 KV 本身必然扰乱 attention。
+
+4. 最终修复：将位置补偿贯穿到 generate 的每一步
+
+我们对推理侧做了关键补丁：在 generate loop 的每一步都显式提供正确的 position_ids（让它从 prompt_len 开始递增，而不是让 HF 根据 past_len 自行推断）。
+
+修复后的 forward trace 典型表现：
+
+prefill：position_ids = 0..136，past_len=4
+
+后续每步：position_ids = 137/138/139/...（不再是 None），attention_mask 与 past_len 同步增长
+
+修复效果：
+
+--hw_kv_mode zero/real + --pos_compensate：恢复到 9/9 valid
+
+manual greedy 回归：30 步 match
+
+这说明 KV 注入通路在“实现层面”已经被打通（cache/position 对齐正确，不再因为框架位置管理导致 invalid）。
+
+5. 训练侧问题：HwKVAligner 曾出现“输出塌缩为全 0”
+
+在推理脚本中加入 --debug_kv_stats 后观察到：
+
+HW-VEC（4090/v100 embedding）是非零且有区分度
+
+但 KV-STATS raw/post 为 全 0（nonzero=0/…），说明 aligner 输出本身塌缩成 noop
+
+这解释了“real KV 注入效果看起来不明显”：通路通了，但注入内容可能是 0。
+
+随后我们调整训练超参并观察到两种阶段：
+
+阶段 A（容易塌缩）：较强正则/较小 kv_scale 初期会把 K/V 均值逐步压回 0
+
+阶段 B（不塌缩）：关闭 l2_reg、提高 kv_scale_init、取消 warmup、放大 kv_scale_max、使用更合适的 scheduler 后，K/V 均值不再趋零，甚至逐步增大，训练是“有效注入”的
+
+这里的关键经验是：“loss 很低”不等价于“注入学到了东西”，必须把 KV-STATS(raw/post) 作为一等公民指标加入训练/评估。
+
+6. 本阶段我们“确定了什么”
+
+Bucket + KV 注入的工程通路已打通：KV 注入不会天然导致 invalid；之前掉 valid 是位置/缓存管理问题（已修复）。
+
+HF generate 在 past 注入场景下必须显式管理 position_ids：否则后续步 position 会漂移，导致自回归轨迹偏移并引发 invalid。
+
+aligner 训练确实存在塌缩风险：需要专门的监控指标（KV stats、梯度 stats、kv_scale 动态）与合适的超参/正则策略。
+
+当前系统距离“端到端迁移优化”只剩下两件事：
+
+aligner 稳定地产生非零且有区分度的 KV（并在端到端评测中带来收益）
+
+路由 LoRA（承接不同硬件/子空间的优化知识复用）
+
+7. 代码更新清单（建议写进 update.md 的“改动记录”）
+
+推理脚本：gen_state_debug_kv.py
+
+新增 KV 注入模式（noop/zero/real）、slots、pos_compensate
+
+新增调试：token budget、stop reason、forward trace、manual greedy、prefill equiv、kv stats、logits compare
+
+关键补丁：generate loop 显式 position_ids 推进（修复 past 场景错位）
+
+训练脚本：train_hw_kv_aligner.py
+
+更安全的 label mask（找不到 schedule 起点就整行 -100）
+
+batch 级过滤（全 -100 样本/全无有效样本则跳过）
+
+KD mismatch 统计与阈值控制（超过阈值跳过该 batch 的 KD）
+
+训练监控：kv mean/max、kv_scale、梯度统计等
+
+工具/脚本：
+
+check_schedule_kd_sanity.py：验证 schedule 段是否为 0、是否 full、student/teacher 长度 mismatch 等
+
+watch_and_eval_hwkv_ckpts.sh：自动观察/评测不同 checkpoint 的生成/valid/延迟等（用于持续回归）
+
+下一步建议（KV 线）
+
+训练继续跑到 70k 合理（你已经观测到“从塌缩 → 不塌缩”的稳定态），但务必做两类回归：
+
+每隔 N steps：debug_kv_stats（raw/post 的非零率、mean/max）
+
+每隔 N steps：固定 workload 的端到端生成 valid + 简单 latency 指标（确认“非零 KV”带来可感知差异，而不是只变大但无收益）
+
+端到端验证建议至少分三档对照：
+
+bucket only（无 KV）
+
+bucket + KV-zero（验证实现/位置无副作用）
+
+bucket + KV-real（验证真实收益）

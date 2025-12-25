@@ -109,6 +109,81 @@ CUDA_VISIBLE_DEVICES=2 python /home/hehangshuai/workspace/tlm/gen/gen_state.py \
   | tee /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_experts_gen/4090/stage02_20250212_gen_iter00.log
 ```
 
+## 4.5 HW-KV 调试推理：`gen_state_debug_kv.py`
+
+背景：当跨硬件/未知硬件时，纯文本提示容易出现 OOV 语义漂移。HW-KV 注入通过 “hardware embedding -> KV past” 的方式，给模型提供硬件侧通道，帮助在相同 bucket/token 前提下仍能区分硬件差异。
+
+三种模式（`--hw_kv_mode`）：
+- `noop`：不注入 past（行为与基线一致），用于对照。
+- `zero`：注入全 0 past（前缀位置存在但无信息），用于测试 prefix 影响。
+- `real`：使用 HwKVAligner 输出的 KV past（真实注入）。
+
+关键参数（相对 `gen_state.py` 新增）：
+- `--use_hw_kv`：开启 KV 注入逻辑。
+- `--hw_kv_mode {noop,zero,real}`：选择注入模式。
+- `--hw_kv_num_slots`：KV 前缀 slot 数（默认 4）。
+- `--pos_compensate`：启用位置补偿（prompt 的 position_ids 从 0 起，不包含 prefix 长度）。
+- `--debug_kv_stats`：输出后 4 层 KV 强度统计（用于确认注入是否生效）。
+- `--debug_forward_trace N`：打印前 N 次 forward 的 input_ids/position_ids/past_len。
+
+常用命令模板：
+
+```bash
+# 4090（真实注入）
+CUDA_VISIBLE_DEVICES=1 python /home/hehangshuai/workspace/tlm/gen/gen_state_debug_kv.py \
+  --model_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/clm_gen_multi_v1_bucket_stage0/checkpoint-30000 \
+  --tokenizer_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/gen_tokenizer_multi_v1_bucket \
+  --sketch_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/4090_gen_eval_only_bert_new_form/0_merge.json \
+  --save_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/4090_gen_eval_only_bert_new_form/bucket_with_kv/gen_bucket_hwkv_4090.json \
+  --target 4090 \
+  --keep_cnt 16 \
+  --use_bucket \
+  --use_hw_kv \
+  --hw_kv_mode real \
+  --hw_kv_aligner_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/hw_kv_aligner_train/hw_kv_aligner.pt \
+  --hardware_embedding_path /home/hehangshuai/workspace/tlm/gen/Embedding/hardware_embeddings_v4.json \
+  --hw_kv_num_slots 4 \
+  --pos_compensate \
+  --debug_kv_stats
+
+# V100
+CUDA_VISIBLE_DEVICES=1 python /home/hehangshuai/workspace/tlm/gen/gen_state_debug_kv.py \
+  --model_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/clm_gen_multi_v1_bucket_stage0/checkpoint-30000 \
+  --tokenizer_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/gen_tokenizer_multi_v1_bucket \
+  --sketch_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/4090_gen_eval_only_bert_new_form/0_merge.json \
+  --save_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/4090_gen_eval_only_bert_new_form/bucket_with_kv/gen_bucket_hwkv_v100.json \
+  --target nvidia/nvidia-v100 \
+  --keep_cnt 16 \
+  --use_bucket \
+  --use_hw_kv \
+  --hw_kv_mode real \
+  --hw_kv_aligner_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/hw_kv_aligner_train/hw_kv_aligner.pt \
+  --hardware_embedding_path /home/hehangshuai/workspace/tlm/gen/Embedding/hardware_embeddings_v4.json \
+  --hw_kv_num_slots 4 \
+  --pos_compensate
+
+# 3090（tag.cc 内置）
+CUDA_VISIBLE_DEVICES=1 python /home/hehangshuai/workspace/tlm/gen/gen_state_debug_kv.py \
+  --model_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/clm_gen_multi_v1_bucket_stage0/checkpoint-30000 \
+  --tokenizer_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/gen_tokenizer_multi_v1_bucket \
+  --sketch_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/4090_gen_eval_only_bert_new_form/0_merge.json \
+  --save_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/4090_gen_eval_only_bert_new_form/bucket_with_kv/gen_bucket_hwkv_3090.json \
+  --target nvidia/geforce-rtx-3090 \
+  --keep_cnt 16 \
+  --use_bucket \
+  --use_hw_kv \
+  --hw_kv_mode real \
+  --hw_kv_aligner_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/hw_kv_aligner_train/hw_kv_aligner.pt \
+  --hardware_embedding_path /home/hehangshuai/workspace/tlm/gen/Embedding/hardware_embeddings_v4.json \
+  --hw_kv_num_slots 4 \
+  --pos_compensate
+```
+
+输出说明：
+- `--save_path` 写入合并后的 JSON（与 `gen_state.py` 同格式）。
+- 同目录下会生成 `gen_state_debug_kv_*.log`，包含 valid 统计、KV 强度、debug 断言信息等。
+- 控制台会打印 “成功处理 workload 数/生成记录数”，可作为 valid 率粗略指标。
+
 ## 5. 真机测量：`measure_programs.py`
 
 ```bash
@@ -173,3 +248,4 @@ python prepare_edge_dataset.py \
 - 记忆点
   - CUDA 设备间任务集一致，可任选 CUDA target 处理 CUDA 记录；CPU 记录需用 LLVM target 注册对应 `all_tasks.pkl`。
   - `target=multi` 的路径推断仅适配 `.../measure_records/<hw>`，不适用于 `to_measure_programs/multi_hardware`，请按上述分批方式处理。
+
