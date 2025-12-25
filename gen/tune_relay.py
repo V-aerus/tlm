@@ -119,7 +119,7 @@ def _parse_args():
         required=True,
     )
     parsed = args.parse_args()
-    parsed.target = tvm.target.Target(parsed.target)
+    parsed.target = tvm.target.Target(resolve_target_string(parsed.target))
     parsed.input_shape = json.loads(parsed.input_shape)
     # parsed.rpc_config = ms.runner.RPCConfig(
     #     tracker_host=parsed.rpc_host,
@@ -128,6 +128,24 @@ def _parse_args():
     #     session_timeout_sec=600,
     # )
     return parsed
+
+
+def resolve_target_string(target_str: str) -> str:
+    if not isinstance(target_str, str):
+        return target_str
+    ts = target_str.strip().lower()
+    if ts in ("4090", "rtx-4090", "nvidia/rtx-4090"):
+        # Canonical CUDA target string for 4090 (sm_86) to match v100-style layout
+        return (
+            "cuda -keys=cuda,gpu "
+            "-arch=sm_86 "
+            "-max_num_threads=1024 "
+            "-max_shared_memory_per_block=49152 "
+            "-max_threads_per_block=1024 "
+            "-registers_per_block=65536 "
+            "-thread_warp_size=32"
+        )
+    return target_str
 
 
 ARGS = _parse_args()

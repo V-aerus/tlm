@@ -98,10 +98,6 @@ def prepare_hw_kv_context(
     if not use_hw_kv:
         return None
 
-    if not hw_kv_aligner_path:
-        print("[WARN] --use_hw_kv is set but no --hw_kv_aligner_path provided; skip KV injection.")
-        return None
-
     if hw_vec is None:
         print("[WARN] No hardware embedding found; using zeros for HwKVAligner.")
         hw_vec = [0.0] * 24
@@ -178,69 +174,29 @@ def gen_func(task, states, input_item, tokenizer, model, device, gen_kwargs, use
             input_ids = torch.tensor(input_ids_all[start : start + batch_size], dtype=torch.long, device=device)
             attention_mask = torch.tensor(attention_mask_all[start : start + batch_size], dtype=torch.long, device=device)
 
-            # 回归旧版行为：裁掉最后一个 token（通常是结尾 special token），与 gold baseline 保持一致
             input_ids = input_ids[:, :-1]
             attention_mask = attention_mask[:, :-1]
-
             gen_kwargs["max_new_tokens"] = min(
                 gen_kwargs["max_new_tokens"], tokenizer.model_max_length - input_ids.shape[-1]
             )
 
             extra_kwargs = {}
-            input_ids_for_gen = input_ids
-            attention_mask_for_gen = attention_mask
-
             if hw_kv_ctx is not None:
                 kv_aligner = hw_kv_ctx["kv_aligner"]
                 hw_vec = hw_kv_ctx["hw_vec"].to(device)
-
-                # 1. HW past (force num_beams=1; beam expansion handled by HF generate)
+                num_beams = gen_kwargs.get("num_beams", 1) or 1
                 if hw_vec.size(0) != input_ids.size(0):
                     hw_vec = hw_vec.expand(input_ids.size(0), -1)
-                hw_past = kv_aligner(hw_vec, batch_size=input_ids.size(0), num_beams=1)
-
-                # 2. Full mask = HW prefix + prompt
-                prefix_len = hw_past[0][0].shape[2]
-                prefix_mask = torch.ones(
-                    input_ids.size(0),
-                    prefix_len,
-                    device=attention_mask.device,
-                    dtype=attention_mask.dtype,
-                )
-                full_attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
-
-                # 3. Split prefill: keep last token for generate, prefill the rest with HW past
-                seq_len = input_ids.size(1)
-                if seq_len > 1:
-                    input_ids_prefill = input_ids[:, :-1]
-                    mask_prefill = full_attention_mask[:, :-1]
-                    with torch.no_grad():
-                        outputs_prefill = model(
-                            input_ids=input_ids_prefill,
-                            attention_mask=mask_prefill,
-                            past_key_values=hw_past,
-                            use_cache=True,
-                        )
-                    final_past = outputs_prefill.past_key_values
-                    input_ids_for_gen = input_ids[:, -1:]  # only last token drives generation
-                else:
-                    final_past = hw_past
-                    input_ids_for_gen = input_ids
-
-                extra_kwargs["past_key_values"] = final_past
-                attention_mask_for_gen = full_attention_mask
-            else:
-                input_ids_for_gen = input_ids
-                attention_mask_for_gen = attention_mask
+                past_key_values = kv_aligner(hw_vec, batch_size=input_ids.size(0), num_beams=num_beams)
+                extra_kwargs["past_key_values"] = past_key_values
 
             response = model.generate(
-                input_ids=input_ids_for_gen,
-                attention_mask=attention_mask_for_gen,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 **gen_kwargs,
                 **extra_kwargs,
             )
-            gen_start_idx = input_ids_for_gen.shape[-1]
-            response = response[:, gen_start_idx:]
+            response = response[:, input_ids.shape[-1] :]
             response_list.extend(response.tolist())
     return [tokenizer.batch_decode(item) for item in response_list]
 

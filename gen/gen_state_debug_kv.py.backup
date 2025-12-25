@@ -6,9 +6,22 @@ import random
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from multiprocessing import Process, Queue
 from typing import Dict, List, Optional, Tuple
+
+# 简易日志文件路径
+LOG_FILE_PATH = None
+
+
+def log_debug(msg: str):
+    if LOG_FILE_PATH:
+        try:
+            with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
 
 import torch
 import tqdm
@@ -160,12 +173,16 @@ def gen_func(task, states, input_item, tokenizer, model, device, gen_kwargs, use
     if len(states) == 0:
         return []
 
+    debug_prompts = None
+    debug_generations = None
+
     tokens = input_to_tokens(
         task,
         states,
         input_item,
         use_bucket=use_bucket,
     )
+    debug_prompts = tokens
     tokenizer.padding_side = "left"
     batch = tokenizer(tokens, padding=True, max_length=None)
     input_ids_all = batch["input_ids"]
@@ -178,7 +195,7 @@ def gen_func(task, states, input_item, tokenizer, model, device, gen_kwargs, use
             input_ids = torch.tensor(input_ids_all[start : start + batch_size], dtype=torch.long, device=device)
             attention_mask = torch.tensor(attention_mask_all[start : start + batch_size], dtype=torch.long, device=device)
 
-            # 回归旧版行为：裁掉最后一个 token（通常是结尾 special token），与 gold baseline 保持一致
+            # 回归旧版行为：裁掉最后一个 token（通常是结尾 special token）
             input_ids = input_ids[:, :-1]
             attention_mask = attention_mask[:, :-1]
 
@@ -242,7 +259,28 @@ def gen_func(task, states, input_item, tokenizer, model, device, gen_kwargs, use
             gen_start_idx = input_ids_for_gen.shape[-1]
             response = response[:, gen_start_idx:]
             response_list.extend(response.tolist())
-    return [tokenizer.batch_decode(item) for item in response_list]
+
+    # Decode to string list (TVM expects decoded schedule strings, not raw tokens)
+    decoded = []
+    if response_list:
+        for ids in response_list:
+            try:
+                decoded.append(tokenizer.batch_decode([ids], skip_special_tokens=False)[0])
+            except Exception:
+                decoded.append(str(ids))
+    if debug_prompts is not None:
+        log_debug("[DEBUG] Prompts:")
+        for i, p in enumerate(debug_prompts[:3]):
+            log_debug(f"  prompt[{i}]: {p}")
+    if decoded:
+        log_debug("[DEBUG] Generations (decoded):")
+        for i, g in enumerate(decoded[:3]):
+            # 使用 decode 保证与旧版一致的可读性
+            try:
+                log_debug(f"  gen[{i}]: {tokenizer.decode(tokenizer.encode(g), skip_special_tokens=True, clean_up_tokenization_spaces=False)}")
+            except Exception:
+                log_debug(f"  gen[{i}]: {g}")
+    return [tokenizer.batch_decode(item) for item in response_list] if response_list else []
 
 
 def merge_json_files_safely(tmp_folder, save_path):
@@ -312,8 +350,12 @@ def worker(
     num_workers,
     use_bucket=False,
     hw_kv_cfg=None,
+    log_file_path=None,
 ):
     try:
+        global LOG_FILE_PATH
+        if log_file_path:
+            LOG_FILE_PATH = log_file_path
         print(f"Initializing TVM environment in worker for target: {original_target}")
         register_data_path(original_target)
         load_and_register_tasks()
@@ -492,6 +534,14 @@ def worker(
                     auto_scheduler.save_records(save_path_i, measure_inputs, measure_results)
                     successful_workloads += 1
                     total_generated += len(measure_inputs)
+                    try:
+                        gens_log = debug_ctx.get("last_generations")
+                        if gens_log:
+                            log_debug(f"[VALID] workload={workload_key} generated={len(measure_inputs)} first_gen='{gens_log[0]}'")
+                        else:
+                            log_debug(f"[VALID] workload={workload_key} generated={len(measure_inputs)} (no decoded gen cached)")
+                    except Exception:
+                        pass
                     print(f"Worker {worker_id}: workload {workload_key} 成功生成 {len(measure_inputs)} 条记录")
                 else:
                     print(f"Worker {worker_id}: workload {workload_key} 未能生成任何有效记录")
@@ -566,6 +616,10 @@ def main():
     processes = []
     tmp_folder = tempfile.mkdtemp(prefix=".gen_state_")
     err_queue = Queue()
+    log_file = os.path.join(
+        os.path.dirname(script_args.save_path) or ".",
+        f"gen_state_debug_kv_{uuid.uuid4().hex[:8]}.log",
+    )
     for gpu_i in range(num_gpus):
         save_path_i = f"{tmp_folder}/{gpu_i}_part"
         device = f"cuda:{gpu_i}"
@@ -594,6 +648,7 @@ def main():
                 num_gpus,
                 script_args.use_bucket,
                 hw_kv_cfg,
+                log_file,
             ),
         )
         p.start()

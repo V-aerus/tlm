@@ -43,6 +43,24 @@ def make_measurer(run_timeout, repeat, number, enable_cpu_cache_flush,
     return measurer
 
 
+def resolve_target_string(target_str: str) -> str:
+    if not isinstance(target_str, str):
+        return target_str
+    ts = target_str.strip().lower()
+    if ts in ("4090", "rtx-4090", "nvidia/rtx-4090"):
+        # Canonical CUDA target string for 4090 (sm_86) to match v100-style layout
+        return (
+            "cuda -keys=cuda,gpu "
+            "-arch=sm_86 "
+            "-max_num_threads=1024 "
+            "-max_shared_memory_per_block=49152 "
+            "-max_threads_per_block=1024 "
+            "-registers_per_block=65536 "
+            "-thread_warp_size=32"
+        )
+    return target_str
+
+
 def remeasure_file(task_idx, inputs, target, target_host, batch_size, measurer_kwargs, measured_path):
     # Make measuer
     measurer_kwargs['log_filename'] = measured_path
@@ -123,9 +141,10 @@ def main(args):
         print("所有记录都已测量，无需重新测量")
         return
 
+    target_str = resolve_target_string(args.target)
     # Remeasure all tasks
     for task_i, (workload_key, (task, records)) in enumerate(input_dict.items()):
-        target = tvm.target.Target(args.target)
+        target = tvm.target.Target(target_str)
         if target.kind.name == 'llvm':
             # Set measurement arguments
             measurer_kwargs = {
