@@ -31,11 +31,21 @@ PERF_DB: Dict[str, HardwarePerfSpec] = {
     "nvidia/geforce-rtx-3090": HardwarePerfSpec(82, 35.6, 936, 6, 24, 3),
     # 中端 GPU
     "nvidia/geforce-rtx-3060": HardwarePerfSpec(28, 12.7, 360, 3, 12, 3),
+    # Turing GPU
+    "nvidia/geforce-rtx-2080-ti": HardwarePerfSpec(68, 13.4, 616, 5.5, 11, 2),
+    # Pascal / Maxwell GPU (no Tensor Core)
+    "nvidia/geforce-gtx-1060": HardwarePerfSpec(10, 4.4, 192, 1.5, 6, 0),  # TODO: verify
+    "nvidia/geforce-gtx-950": HardwarePerfSpec(6, 1.6, 105, 1.0, 2, 0),  # TODO: verify
     # 边缘/嵌入式 GPU
     "nvidia/jetson-agx-xavier": HardwarePerfSpec(8, 1.4, 137, 0.5, 32, 1),
     "nvidia/jetson-orin": HardwarePerfSpec(16, 5.3, 204, 3, 64, 3),  # TODO: verify L2/VRAM
     # CPU
     "aws/cpu/c5.18xlarge": HardwarePerfSpec(36, 2.3, 120, 36, 128, 0),
+    "intel/core-i7-10510u": HardwarePerfSpec(4, 0.6, 25, 1, 16, 0),  # TODO: verify
+    "amd/ryzen-7-5800h": HardwarePerfSpec(8, 1.5, 45, 4, 32, 0),  # TODO: verify
+    "intel/xeon-gold-6226": HardwarePerfSpec(12, 1.2, 120, 12, 128, 0),  # TODO: verify
+    "intel/core-i7-12700k": HardwarePerfSpec(12, 3.0, 50, 12, 32, 0),  # TODO: verify
+    "intel/core-i5-12400": HardwarePerfSpec(6, 1.2, 45, 7.5, 16, 0),  # TODO: verify
     # 可选：树莓派（占位，待校正）
     "raspberry-pi/4b-aarch64": HardwarePerfSpec(4, 0.1, 30, 1, 4, 0),  # TODO: rough guess
 }
@@ -173,6 +183,10 @@ def _default_tvm_config(name: str) -> Dict[str, Any]:
             cfg["arch"] = "sm_86"
         elif "4090" in name_l:
             cfg["arch"] = "sm_86"
+        elif "1060" in name_l:
+            cfg["arch"] = "sm_61"
+        elif "950" in name_l:
+            cfg["arch"] = "sm_52"
         elif "xavier" in name_l:
             cfg["arch"] = "sm_72"
         elif "orin" in name_l:

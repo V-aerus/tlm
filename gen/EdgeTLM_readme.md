@@ -182,6 +182,56 @@ CUDA_VISIBLE_DEVICES=1 python /home/hehangshuai/workspace/tlm/gen/gen_state_debu
 输出说明：
 - `--save_path` 写入合并后的 JSON（与 `gen_state.py` 同格式）。
 - 同目录下会生成 `gen_state_debug_kv_*.log`，包含 valid 统计、KV 强度、debug 断言信息等。
+
+## 4.6 KV + LoRA 路由推理：`gen_state_kv_lora.py`
+
+该脚本在 `gen_state_debug_kv.py` 的基础上加入“多 LoRA 专家路由”，用于端到端验证：
+bucket + KV + LoRA 路由。  
+注意：**现有 LoRA 专家 `router.json` 的 `hardware_dim=29`（v2 embedding）**，所以若使用
+`edge_experts/*/stage02_20250212_fullrun`，请显式传 `--edge_embedding_path Embedding/hardware_embeddings_v2.json`，
+避免维度不匹配。
+
+关键参数（相对 `gen_state_debug_kv.py` 新增）：
+- `--edge_expert_dirs`：LoRA 专家目录，可多传（以空格分隔）。
+- `--edge_embedding_path`：路由用硬件 embedding（默认 **v4**，若用旧专家请改成 v2）。
+- `--edge_topk`：路由取前 K 个专家（默认 1）。
+- `--sketch_hw_candidates`：手动限定可用草图硬件（逗号分隔）；若不填则自动扫描可用硬件并挑最相近者。
+- `--debug_hw_similarity`：打印目标硬件与专家路由向量的相似度（方便调试）。
+
+示例（4090）：
+```bash
+CUDA_VISIBLE_DEVICES=1 python /home/hehangshuai/workspace/tlm/gen/gen_state_kv_lora.py \
+  --model_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/clm_gen_multi_v1_bucket_stage0/checkpoint-30000 \
+  --tokenizer_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/gen_tokenizer_multi_v1_bucket \
+  --edge_expert_dirs /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_experts/4090/stage02_20250212_fullrun \
+  --edge_embedding_path /home/hehangshuai/workspace/tlm/gen/Embedding/hardware_embeddings_v2.json \
+  --sketch_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_sketches/{hw}/iter00/0_merge.json \
+  --save_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_experts_gen/4090/gen_kv_lora.json \
+  --target 4090 \
+  --use_bucket \
+  --use_hw_kv --hw_kv_mode real \
+  --hw_kv_aligner_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/hw_kv_aligner_train/hw_kv_aligner.pt \
+  --hardware_embedding_path /home/hehangshuai/workspace/tlm/gen/Embedding/hardware_embeddings_v4.json \
+  --pos_compensate
+```
+
+示例（3090，自动选择最近硬件草图）：
+```bash
+CUDA_VISIBLE_DEVICES=1 python /home/hehangshuai/workspace/tlm/gen/gen_state_kv_lora.py \
+  --model_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/clm_gen_multi_v1_bucket_stage0/checkpoint-30000 \
+  --tokenizer_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/gen_tokenizer_multi_v1_bucket \
+  --edge_expert_dirs /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_experts/4090/stage02_20250212_fullrun \
+  --edge_embedding_path /home/hehangshuai/workspace/tlm/gen/Embedding/hardware_embeddings_v2.json \
+  --sketch_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_sketches/{hw}/iter00/0_merge.json \
+  --save_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_experts_gen/3090/gen_kv_lora.json \
+  --target nvidia/geforce-rtx-3090 \
+  --use_bucket \
+  --use_hw_kv --hw_kv_mode real \
+  --hw_kv_aligner_path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/Model/hw_kv_aligner_train/hw_kv_aligner.pt \
+  --hardware_embedding_path /home/hehangshuai/workspace/tlm/gen/Embedding/hardware_embeddings_v4.json \
+  --pos_compensate \
+  --debug_hw_similarity
+```
 - 控制台会打印 “成功处理 workload 数/生成记录数”，可作为 valid 率粗略指标。
 
 ## 5. 真机测量：`measure_programs.py`
@@ -248,4 +298,3 @@ python prepare_edge_dataset.py \
 - 记忆点
   - CUDA 设备间任务集一致，可任选 CUDA target 处理 CUDA 记录；CPU 记录需用 LLVM target 注册对应 `all_tasks.pkl`。
   - `target=multi` 的路径推断仅适配 `.../measure_records/<hw>`，不适用于 `to_measure_programs/multi_hardware`，请按上述分批方式处理。
-

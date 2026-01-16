@@ -5,6 +5,7 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -28,6 +29,12 @@ def log_debug(msg: str):
         except Exception:
             pass
 
+# Ensure local PEFT (if bundled) is importable before importing PeftModel.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_PEFT_PATH = os.path.join(_BASE_DIR, "MosLora", "peft", "src")
+if os.path.isdir(_LOCAL_PEFT_PATH) and _LOCAL_PEFT_PATH not in sys.path:
+    sys.path.append(_LOCAL_PEFT_PATH)
+
 import torch
 import tqdm
 import tvm
@@ -38,6 +45,13 @@ from common import load_and_register_tasks, register_data_path
 from hw_kv_aligner import HwKVAligner
 from make_dataset import input_to_tokens
 from postprocess import check_measured
+from modeling import (
+    BasePlusExperts,
+    ExpertRegistry,
+    FrozenBaseWrapper,
+    GatedLoRAExpert,
+    PeftDeltaWrapper,
+)
 
 try:
     from peft import PeftModel
@@ -55,6 +69,23 @@ class ScriptArguments:
 
     tokenizer_path: Optional[str] = field(default=None, metadata={"help": "Optional tokenizer path (defaults to model_path)"})
     adapter_path: Optional[str] = field(default=None, metadata={"help": "Optional single LoRA/PEFT adapter path"})
+    edge_expert_dirs: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated EdgeTLM LoRA expert directories (enables expert routing)"},
+    )
+    edge_embedding_path: str = field(
+        default="Embedding/hardware_embeddings_v4.json",
+        metadata={"help": "Path to hardware_embeddings_v4.json for expert routing (must match router.json dim)"},
+    )
+    edge_topk: int = field(default=1, metadata={"help": "Top-K experts to activate during inference"})
+    edge_dump_meta: bool = field(
+        default=False,
+        metadata={"help": "Dump expert names/weights into log (and attach to outputs if supported)"},
+    )
+    edge_debug_topk: bool = field(
+        default=False,
+        metadata={"help": "Log top-k expert weights once per process (debug)."},
+    )
     hardware_embedding_path: str = field(
         default="Embedding/hardware_embeddings_v4.json",
         metadata={"help": "Path to hardware_embeddings_v4.json"},
@@ -109,6 +140,14 @@ class ScriptArguments:
         default=False,
         metadata={"help": "Debug: compare direct generate vs split prefill (no KV)"},
     )
+    debug_hw_similarity: bool = field(
+        default=False,
+        metadata={"help": "Debug: log cosine similarity between target hw and candidate/expert hw embeddings"},
+    )
+    sketch_hw_candidates: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional hardware ids for {hw} placeholder in --sketch_path (comma-separated)"},
+    )
 
 
 DEFAULT_HW_NAME_MAP = {
@@ -122,7 +161,30 @@ DEFAULT_HW_NAME_MAP = {
     "xavier": "nvidia/jetson-agx-xavier",
     "xeon": "aws/cpu/c5.18xlarge",
     "c5.18xlarge": "aws/cpu/c5.18xlarge",
+    "2080": "nvidia/geforce-rtx-2080-ti",
+    "2080ti": "nvidia/geforce-rtx-2080-ti",
 }
+
+def extract_hardware_id_from_target(target) -> str:
+    """
+    从 target 字符串中提取硬件 id（用于 expert routing）。
+    """
+    if not target:
+        return "v100"
+    target_str = str(target).lower()
+    if "v100" in target_str:
+        return "v100"
+    if "3090" in target_str:
+        return "3090"
+    if "4090" in target_str or "sm_86" in target_str:
+        return "4090"
+    if "2080" in target_str or "sm_75" in target_str:
+        return "2080"
+    if "xavier" in target_str or "sm_72" in target_str:
+        return "xavier"
+    if "xeon" in target_str or "skylake" in target_str:
+        return "xeon"
+    return "v100"
 
 
 def load_hardware_embeddings(path: str) -> Dict[str, List[float]]:
@@ -158,6 +220,59 @@ class DebugUtils:
         max_abs = max(abs(x) for x in vec)
         first8 = vec[:8]
         return f"[HW-VEC] {name}: mean_abs={mean_abs:.6f} max_abs={max_abs:.6f} first8={first8}"
+
+    @staticmethod
+    def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+        if not vec_a or not vec_b:
+            return float("nan")
+        ta = torch.tensor(vec_a, dtype=torch.float32)
+        tb = torch.tensor(vec_b, dtype=torch.float32)
+        denom = (ta.norm() * tb.norm()).item()
+        if denom == 0:
+            return float("nan")
+        return float(torch.dot(ta, tb).item() / denom)
+
+
+def pick_best_hw_candidate(
+    target_hw: str,
+    candidate_hws: List[str],
+    embeddings: Dict[str, List[float]],
+) -> Tuple[str, List[Tuple[str, float]]]:
+    target_name, target_vec = resolve_hw_embedding(target_hw, embeddings)
+    if target_vec is None:
+        raise ValueError(f"Cannot resolve embedding for target {target_hw}")
+    scored: List[Tuple[str, float]] = []
+    for cand in candidate_hws:
+        cand_name, cand_vec = resolve_hw_embedding(cand, embeddings)
+        if cand_vec is None:
+            continue
+        sim = DebugUtils.cosine_similarity(target_vec, cand_vec)
+        scored.append((cand, sim))
+    if not scored:
+        raise ValueError("No valid candidates with embeddings for sketch selection")
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[0][0], scored
+
+
+def discover_hw_candidates() -> List[str]:
+    """
+    Auto-discover available hardware folders that have both network_info and to_measure_programs.
+    This is used when --sketch_path contains {hw} and --sketch_hw_candidates is not provided.
+    """
+    data_root = os.environ.get("TLM_DATA_ROOT", "/home/hehangshuai/workspace/tlm/tlm_dataset/gen")
+    net_root = os.path.join(data_root, "dataset", "network_info")
+    prog_root = os.path.join(data_root, "dataset", "to_measure_programs")
+    if not os.path.isdir(net_root) or not os.path.isdir(prog_root):
+        return []
+    net_names = {n for n in os.listdir(net_root) if os.path.isdir(os.path.join(net_root, n))}
+    prog_names = {n for n in os.listdir(prog_root) if os.path.isdir(os.path.join(prog_root, n))}
+    candidates = []
+    for name in sorted(net_names & prog_names):
+        net_dir = os.path.join(net_root, name)
+        prog_dir = os.path.join(prog_root, name)
+        if glob.glob(os.path.join(net_dir, "*.task.pkl")) and glob.glob(os.path.join(prog_dir, "*.json")):
+            candidates.append(name)
+    return candidates
 
     @staticmethod
     def kv_stats(tag: str, k: torch.Tensor, v: torch.Tensor) -> str:
@@ -262,12 +377,154 @@ def load_model_for_inference(args: ScriptArguments):
     tokenizer = AutoTokenizer.from_pretrained(tok_path)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    expert_dirs = []
+    if args.edge_expert_dirs:
+        expert_dirs = [p.strip() for p in args.edge_expert_dirs.split(",") if p.strip()]
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_path)
-    if args.adapter_path:
+    if expert_dirs:
         if PeftModel is None:
-            raise ImportError("peft is required to load adapter_path")
-        model = PeftModel.from_pretrained(model, args.adapter_path)
+            raise ImportError("peft is required to load edge_expert_dirs")
+
+        print("Mode: KV + EdgeTLM expert routing")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        print("Loading base model...")
+        base_model = AutoModelForCausalLM.from_pretrained(args.model_path)
+        base_model.to(device)
+        base_model.eval()
+        base_model.requires_grad_(False)
+
+        frozen_base = FrozenBaseWrapper(base_model)
+        embeddings = load_hardware_embeddings(args.edge_embedding_path)
+        hw_id = args.target_hardware or extract_hardware_id_from_target(args.target)
+        hw_name, hw_vector = resolve_hw_embedding(hw_id, embeddings)
+        if hw_vector is None:
+            print(f"[WARN] No hardware embedding found for {hw_id}; using zeros.")
+            hw_vector = [0.0] * next(iter(embeddings.values())).__len__()
+        log_debug(DebugUtils.hw_vec_stats(f"target({hw_id})", hw_vector))
+        if hw_name:
+            log_debug(DebugUtils.hw_vec_stats(f"{hw_id}({hw_name})", hw_vector))
+        hw_emb_tensor = torch.tensor(hw_vector, dtype=torch.float32, device=device)
+
+        registry = ExpertRegistry()
+        for dir_path in expert_dirs:
+            resolved_dir = os.path.abspath(dir_path)
+            router_path = os.path.join(resolved_dir, "router.json")
+            if not os.path.exists(router_path):
+                raise FileNotFoundError(f"router.json not found in {resolved_dir}")
+            print(f"Loading Edge expert from {resolved_dir}")
+
+            expert_model = AutoModelForCausalLM.from_pretrained(args.model_path)
+            expert_model = PeftModel.from_pretrained(expert_model, resolved_dir)
+            expert_model.to(device)
+            expert_model.eval()
+            expert_model.requires_grad_(False)
+
+            delta_wrapper = PeftDeltaWrapper(expert_model)
+
+            with open(router_path, "r", encoding="utf-8") as rf:
+                router_state = json.load(rf)
+            r_vector = torch.tensor(router_state["r"], dtype=torch.float32, device=device)
+            if r_vector.numel() != hw_emb_tensor.numel():
+                raise ValueError(
+                    "Router dim mismatch: "
+                    f"router={r_vector.numel()} vs hw_emb={hw_emb_tensor.numel()} for {resolved_dir}. "
+                    "Please pass a matching --edge_embedding_path (e.g., v2) or retrain experts."
+                )
+            expert = GatedLoRAExpert(delta_wrapper, r_dim=r_vector.numel(), init_router=r_vector, reset_lora=False)
+            beta_value = float(router_state.get("beta", float(expert.beta.detach().cpu())))
+            tau_value = float(router_state.get("tau", float(expert.tau.detach().cpu())))
+            with torch.no_grad():
+                expert.beta.fill_(beta_value)
+                expert.tau.fill_(tau_value)
+            expert.to(device)
+
+            expert_name = os.path.basename(resolved_dir.rstrip("/"))
+            registry.register(expert_name, expert)
+
+            if args.debug_hw_similarity:
+                meta_ids = router_state.get("meta", {}).get("hardware_ids", [])
+                for meta_id in meta_ids:
+                    cand_name, cand_vec = resolve_hw_embedding(meta_id, embeddings)
+                    if cand_vec is None:
+                        continue
+                    sim = DebugUtils.cosine_similarity(hw_vector, cand_vec)
+                    msg = f"[HW-SIM] target={hw_id} vs {meta_id}: cos={sim:.4f}"
+                    print(msg)
+                    log_debug(msg)
+
+        system = BasePlusExperts(frozen_base, registry)
+        topk = max(1, args.edge_topk)
+        original_forward = base_model.forward
+
+        debug_topk_once = {"printed": False}
+
+        def edge_forward(*forward_args, **forward_kwargs):
+            input_ids = forward_kwargs.get("input_ids")
+            if input_ids is None and forward_args:
+                input_ids = forward_args[0]
+            if input_ids is None:
+                raise ValueError("EdgeTLM forward requires input_ids.")
+
+            base_outputs = original_forward(*forward_args, **forward_kwargs)
+            base_logits = base_outputs.logits
+
+            batch_size = input_ids.shape[0]
+            hw_batch = hw_emb_tensor.unsqueeze(0).expand(batch_size, -1)
+
+            expert_kwargs = dict(forward_kwargs)
+            # input_ids is already passed positionally to forward_multi; avoid duplicates.
+            expert_kwargs.pop("input_ids", None)
+            expert_kwargs.pop("inputs_embeds", None)
+            expert_kwargs["base_logits"] = base_logits
+
+            logits, meta = system.forward_multi(
+                input_ids,
+                hw_emb=hw_batch,
+                topk=topk,
+                expert_kwargs=expert_kwargs,
+                cached_base=base_logits,
+            )
+            if (args.edge_debug_topk or os.environ.get("EDGE_EXPERT_DEBUG_TOPK") == "1") and not debug_topk_once["printed"]:
+                debug_topk_once["printed"] = True
+                weights = meta.get("weights")
+                names = meta.get("names")
+                if weights is not None and names is not None and weights.numel() > 0:
+                    # weights: [1+E, B], names: ["BASE"] + expert_names
+                    w0 = weights[:, 0].detach().cpu()
+                    base_w = w0[0].item()
+                    expert_w = w0[1:]
+                    k = min(topk, expert_w.numel())
+                    if k > 0:
+                        vals, idxs = torch.topk(expert_w, k=k)
+                        chosen = [names[i + 1] for i in idxs.tolist()]
+                        msg = (
+                            f"[EdgeTLM] topk_experts={chosen} "
+                            f"weights={vals.tolist()} base_w={base_w:.4f}"
+                        )
+                    else:
+                        msg = f"[EdgeTLM] no experts selected (base_w={base_w:.4f})"
+                else:
+                    msg = "[EdgeTLM] topk debug skipped (missing weights/names)"
+                print(msg)
+                log_debug(msg)
+            base_outputs.logits = logits
+            if args.edge_dump_meta:
+                base_outputs.edge_meta = meta
+            return base_outputs
+
+        import inspect
+
+        # Preserve signature so generate() accepts position_ids/attention_mask.
+        edge_forward.__signature__ = inspect.signature(original_forward)
+        base_model.forward = edge_forward
+        model = base_model
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model_path)
+        if args.adapter_path:
+            if PeftModel is None:
+                raise ImportError("peft is required to load adapter_path")
+            model = PeftModel.from_pretrained(model, args.adapter_path)
 
     if args.debug_forward_trace and args.debug_forward_trace > 0:
         import inspect
@@ -903,6 +1160,9 @@ def merge_json_files_safely(tmp_folder, save_path):
     print(f"合并完成: {valid_files}/{total_files} 个文件有效，共 {total_records} 条记录")
 
     try:
+        parent_dir = os.path.dirname(save_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         with open(save_path, "w", encoding="utf-8") as f:
             for record in all_records:
                 f.write(record + "\n")
@@ -921,6 +1181,12 @@ def worker(
     model_path,
     tokenizer_path,
     adapter_path,
+    edge_expert_dirs,
+    edge_embedding_path,
+    edge_topk,
+    edge_dump_meta,
+    edge_debug_topk,
+    debug_hw_similarity,
     target_hardware,
     original_target,
     device,
@@ -950,6 +1216,11 @@ def worker(
         global LOG_FILE_PATH
         if log_file_path:
             LOG_FILE_PATH = log_file_path
+        if edge_debug_topk:
+            os.environ["EDGE_EXPERT_DEBUG_TOPK"] = "1"
+            msg = "[DEBUG_TOPK] enabled"
+            print(msg)
+            log_debug(msg)
         if worker_id == 0 and hw_kv_cfg and hw_kv_cfg.get("hw_vec_stats"):
             for msg in hw_kv_cfg["hw_vec_stats"]:
                 print(msg)
@@ -1003,6 +1274,12 @@ def worker(
             keep_cnt=keep_cnt,
             target=original_target,
             adapter_path=adapter_path,
+            edge_expert_dirs=edge_expert_dirs,
+            edge_embedding_path=edge_embedding_path,
+            edge_topk=edge_topk,
+            edge_dump_meta=edge_dump_meta,
+            edge_debug_topk=edge_debug_topk,
+            debug_hw_similarity=debug_hw_similarity,
             target_hardware=target_hardware,
             allow_repeat=allow_repeat,
             is_build=is_build,
@@ -1134,10 +1411,14 @@ def worker(
                         if len(measure_inputs) >= keep_cnt:
                             break
                     except Exception as e:
-                        print(f"Worker {worker_id}: workload {workload_key} 第{retry_i+1}次重试时出错: {e}")
+                        msg = f"Worker {worker_id}: workload {workload_key} 第{retry_i+1}次重试时出错: {e}"
+                        print(msg)
+                        log_debug(msg)
                         retry_i += 1
                         if retry_i >= 5:
-                            print(f"Worker {worker_id}: workload {workload_key} 重试5次后仍然失败，跳过")
+                            msg = f"Worker {worker_id}: workload {workload_key} 重试5次后仍然失败，跳过"
+                            print(msg)
+                            log_debug(msg)
                             break
                         continue
 
@@ -1158,13 +1439,18 @@ def worker(
                         pass
                     print(f"Worker {worker_id}: workload {workload_key} 成功生成 {len(measure_inputs)} 条记录")
                 else:
-                    print(f"Worker {worker_id}: workload {workload_key} 未能生成任何有效记录")
+                    msg = f"Worker {worker_id}: workload {workload_key} 未能生成任何有效记录"
+                    print(msg)
+                    log_debug(msg)
 
             except Exception as e:
-                print(f"Worker {worker_id}: 处理workload {workload_key} 时发生严重错误: {e}")
+                msg = f"Worker {worker_id}: 处理workload {workload_key} 时发生严重错误: {e}"
+                print(msg)
+                log_debug(msg)
                 import traceback
 
                 traceback.print_exc()
+                log_debug(traceback.format_exc())
                 continue
 
         print(f"Worker {worker_id}: 处理完成！成功处理 {successful_workloads}/{total_workloads} 个workload，共生成 {total_generated} 条记录")
@@ -1190,7 +1476,33 @@ def main():
     script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
     print(script_args)
 
+    if script_args.edge_debug_topk:
+        os.environ["EDGE_EXPERT_DEBUG_TOPK"] = "1"
+
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+    if "{hw}" in script_args.sketch_path:
+        sel_embeddings = load_hardware_embeddings(script_args.hardware_embedding_path)
+        target_id = script_args.target_hardware or str(script_args.target)
+        if script_args.sketch_hw_candidates:
+            candidates = [c.strip() for c in script_args.sketch_hw_candidates.split(",") if c.strip()]
+            msg = f"[SKETCH] using user-provided candidates {candidates} for target={target_id}"
+        else:
+            candidates = discover_hw_candidates()
+            msg = (
+                "[SKETCH] auto-discovered candidates from network_info/to_measure_programs: "
+                f"{candidates} (target={target_id})"
+            )
+        if not candidates:
+            raise ValueError("No sketch candidates found for {hw} selection")
+        best_hw, scored = pick_best_hw_candidate(target_id, candidates, sel_embeddings)
+        script_args.sketch_path = script_args.sketch_path.replace("{hw}", best_hw)
+        msg = msg + f" -> selected {best_hw}"
+        print(msg)
+        log_debug(msg)
+        if script_args.debug_hw_similarity:
+            for cand, sim in scored:
+                log_debug(f"[HW-SIM] target={target_id} vs {cand}: cos={sim:.4f}")
 
     gen_kwargs = {
         "min_length": -1,
@@ -1211,6 +1523,11 @@ def main():
     use_hw_kv_flag = script_args.use_hw_kv or (mode in ("noop", "zero", "real"))
 
     if use_hw_kv_flag:
+        if mode == "real" and not script_args.hw_kv_aligner_path:
+            raise ValueError("--hw_kv_mode real requires --hw_kv_aligner_path")
+        if mode == "real" and not script_args.pos_compensate:
+            script_args.pos_compensate = True
+            print("[KV] pos_compensate auto-enabled for hw_kv_mode=real")
         hw_vec = None
         stats = None
         if mode not in ("zero", "noop"):
@@ -1248,6 +1565,9 @@ def main():
         print(f"未设置CUDA_VISIBLE_DEVICES，使用所有{num_gpus}个GPU")
 
     processes = []
+    save_parent = os.path.dirname(script_args.save_path)
+    if save_parent:
+        os.makedirs(save_parent, exist_ok=True)
     tmp_folder = tempfile.mkdtemp(prefix=".gen_state_")
     err_queue = Queue()
     log_file = os.path.join(
@@ -1272,6 +1592,12 @@ def main():
                 script_args.model_path,
                 script_args.tokenizer_path,
                 script_args.adapter_path,
+                script_args.edge_expert_dirs,
+                script_args.edge_embedding_path,
+                script_args.edge_topk,
+                script_args.edge_dump_meta,
+                script_args.edge_debug_topk,
+                script_args.debug_hw_similarity,
                 script_args.target_hardware,
                 script_args.target,
                 device,

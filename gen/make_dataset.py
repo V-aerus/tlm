@@ -8,7 +8,7 @@ import json
 import copy
 from tvm import auto_scheduler
 from tvm.auto_scheduler.measure_record import load_record_from_string
-from common import register_data_path, load_and_register_tasks, get_hold_out_five_files, get_bert_files
+from common import register_data_path, load_and_register_tasks, get_hold_out_five_files, get_bert_files, get_ansor_eval_files
 import tvm
 from functools import partial
 import subprocess
@@ -28,6 +28,7 @@ FOR_GEN = "for_gen"
 FOR_GEN_BEST = "for_gen_best"
 FOR_GEN_EVAL_SKETCH = "for_gen_eval_sketch"
 FOR_GEN_EVAL_SKETCH_ONLY_BERT = "for_gen_eval_sketch_only_bert"
+FOR_GEN_EVAL_SKETCH_ANSOR = "for_gen_eval_sketch_ansor"
 FOR_GEN_EVALTUNING_SKETCH = "for_gen_evaltuning_sketch"
 FOR_GEN_TRAIN_SKETCH = "for_gen_train_sketch"
 FOR_GEN_BEST_ALL = "for_gen_best_all"
@@ -35,7 +36,7 @@ FOR_GEN_BEST_ALL = "for_gen_best_all"
 
 @dataclass
 class ScriptArguments:
-    for_type: str = field(metadata={"help": "", "choices": [FOR_GEN_TOKENIZER, FOR_GEN, FOR_GEN_BEST, FOR_GEN_EVAL_SKETCH, FOR_GEN_TRAIN_SKETCH, FOR_GEN_BEST_ALL, FOR_GEN_EVALTUNING_SKETCH, FOR_LATENCY, FOR_GEN_EVAL_SKETCH_ONLY_BERT]})
+    for_type: str = field(metadata={"help": "", "choices": [FOR_GEN_TOKENIZER, FOR_GEN, FOR_GEN_BEST, FOR_GEN_EVAL_SKETCH, FOR_GEN_TRAIN_SKETCH, FOR_GEN_BEST_ALL, FOR_GEN_EVALTUNING_SKETCH, FOR_LATENCY, FOR_GEN_EVAL_SKETCH_ONLY_BERT, FOR_GEN_EVAL_SKETCH_ANSOR]})
     target: str = field(metadata={"help": ""})
     dataset_path: str = field(metadata={"help": ""})
     tokenizer_path: str = field(metadata={"help": ""})
@@ -47,7 +48,7 @@ class ScriptArguments:
     schedule_file_path: str = field(default=None, metadata={"help": ""})
     emit_hw_student: bool = field(default=False, metadata={"help": "Emit additional student text with hardware token placeholder"})
     hw_token_placeholder: str = field(default="[MASK]", metadata={"help": "Token placeholder used to replace hardware text"})
-    hardware_embedding_path: str = field(default="Embedding/hardware_embeddings_v2.json", metadata={"help": "Path to hardware embedding json"})
+    hardware_embedding_path: str = field(default="Embedding/hardware_embeddings_v4.json", metadata={"help": "Path to hardware embedding json"})
     file_filter: str = field(default=None, metadata={"help": "Optional regex to filter input files by basename"})
 
 
@@ -55,7 +56,8 @@ def for_clm_or_mlm(for_type):
     if for_type == FOR_GEN_TOKENIZER or for_type == FOR_GEN or \
        for_type == FOR_GEN_BEST or for_type == FOR_GEN_EVAL_SKETCH or \
        for_type == FOR_GEN_TRAIN_SKETCH or for_type == FOR_GEN_BEST_ALL or \
-       for_type == FOR_GEN_EVALTUNING_SKETCH or for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
+       for_type == FOR_GEN_EVALTUNING_SKETCH or for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT or \
+       for_type == FOR_GEN_EVAL_SKETCH_ANSOR:
         return "clm"
     elif for_type == FOR_LATENCY:
         return "mlm"
@@ -344,7 +346,7 @@ def process_file(args, tmp_folder, for_type, keep_cnt, hw_token_placeholder=None
             hardware_embeddings=hardware_embeddings,
             emit_hw_student=emit_hw_student,
         )
-    elif for_type == FOR_GEN_EVAL_SKETCH or for_type == FOR_GEN_TRAIN_SKETCH or for_type == FOR_GEN_EVALTUNING_SKETCH or for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
+    elif for_type == FOR_GEN_EVAL_SKETCH or for_type == FOR_GEN_TRAIN_SKETCH or for_type == FOR_GEN_EVALTUNING_SKETCH or for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT or for_type == FOR_GEN_EVAL_SKETCH_ANSOR:
         data_list = for_gen_eval_sketch(lines, keep_cnt, for_type, canonical_target_override=canonical_target_override)
     else:
         assert(False)
@@ -609,13 +611,15 @@ def main():
             canonical_target_override=canonical_target_override,
         )
         make_dataset(filename, script_args.save_path, script_args.tokenizer_path, for_clm_or_mlm(script_args.for_type), valid_percentage=0)
-    elif script_args.for_type == FOR_GEN_EVAL_SKETCH or script_args.for_type == FOR_GEN_EVALTUNING_SKETCH or script_args.for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
+    elif script_args.for_type == FOR_GEN_EVAL_SKETCH or script_args.for_type == FOR_GEN_EVALTUNING_SKETCH or script_args.for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT or script_args.for_type == FOR_GEN_EVAL_SKETCH_ANSOR:
         files = glob.glob(os.path.join(script_args.dataset_path, "*.json"))
         files = filter_files_with_regex(files, script_args.file_filter)
         files.sort()
         print("Dataset file cnt:", len(files))
         if script_args.for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
             hold_out_files = get_bert_files(script_args.target)
+        elif script_args.for_type == FOR_GEN_EVAL_SKETCH_ANSOR:
+            hold_out_files = get_ansor_eval_files(script_args.target)
         else:
             hold_out_files = get_hold_out_five_files(script_args.target)
         hold_out_set = set()
@@ -627,8 +631,8 @@ def main():
             pos = base.find('([')
             return base[pos:] if pos > 0 else base
         hold_out_set_normalized = {_normalize_name(f) for f in hold_out_files}
-        # 兼容旧逻辑：ONLY_BERT 仅保留 bert hold-out；其他模式移除 hold-out
-        if script_args.for_type == FOR_GEN_EVAL_SKETCH_ONLY_BERT:
+        # 兼容旧逻辑：ONLY_BERT/ANSOR 仅保留对应 hold-out；其他模式移除 hold-out
+        if script_args.for_type in (FOR_GEN_EVAL_SKETCH_ONLY_BERT, FOR_GEN_EVAL_SKETCH_ANSOR):
             files_new = []
             for file in files:
                 # 优先匹配去前缀名称；若不匹配，尝试去掉硬件前缀直接与原始 hold-out 名称比对

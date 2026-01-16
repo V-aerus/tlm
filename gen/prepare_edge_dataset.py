@@ -13,12 +13,12 @@ from datasets import DatasetDict
 from transformers import AutoTokenizer
 
 
-EMBEDDING_PATH_DEFAULT = Path("Embedding/hardware_embeddings_v2.json")
+EMBEDDING_PATH_DEFAULT = Path("Embedding/hardware_embeddings_v4.json")
 KNOWN_DEFAULTS = {
-    "v100": "nvidia/nvidia-v100",
-    "4090": "nvidia/nvidia-a40",  # sm_86
-    "xavier": "nvidia/jetson-agx-xavier",
-    "xeon": "aws/cpu/c5.18xlarge",
+    "v100": ["nvidia/nvidia-v100"],
+    "4090": ["nvidia/rtx-4090", "nvidia/nvidia-a40"],  # sm_86 (v4 uses rtx-4090)
+    "xavier": ["nvidia/jetson-agx-xavier"],
+    "xeon": ["aws/cpu/c5.18xlarge"],
 }
 
 
@@ -34,7 +34,7 @@ def detect_hardware(target_str: str) -> Tuple[str, str]:
     if "sm_70" in lower or "v100" in lower:
         return "v100", "nvidia/nvidia-v100"
     if "sm_86" in lower or "4090" in lower:
-        return "4090", "nvidia/nvidia-a40"
+        return "4090", "nvidia/rtx-4090"
     if "jetson" in lower or "sm_72" in lower or "xavier" in lower:
         return "xavier", "nvidia/jetson-agx-xavier"
     if "llvm" in lower or "skylake" in lower or "xeon" in lower:
@@ -46,10 +46,34 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build EdgeTLM training dataset with baseline latency and hardware embeddings.")
     parser.add_argument("--sft-dataset-path", default=None, help="Path to HuggingFace dataset folder (e.g., all_gen_best_multi).")
     parser.add_argument("--output-jsonl", required=True, help="Output JSONL file path.")
-    parser.add_argument("--embedding-json", default=str(EMBEDDING_PATH_DEFAULT), help="Hardware embedding json file.")
+    parser.add_argument(
+        "--embedding-json",
+        default=str(EMBEDDING_PATH_DEFAULT),
+        help="Hardware embedding json file (default: Embedding/hardware_embeddings_v4.json).",
+    )
     parser.add_argument("--allow-missing-lora", action="store_true", help="If set, lat_lora_star will be None; otherwise defaults to lat_base_star.")
     parser.add_argument("--base-jsonl", default=None, help="Optional JSONL containing base measurements (produced by prepare_edge_dataset.py).")
     parser.add_argument("--lora-jsonl", default=None, help="Optional JSONL containing LoRA measurements (e.g., postprocess + make_dataset output).")
+    parser.add_argument("--teacher-jsonl", default=None, help="Optional JSONL providing teacher text (e.g., all-mode best).")
+    parser.add_argument(
+        "--merge_mode",
+        choices=("base_left", "lora_left"),
+        default="base_left",
+        help="JSONL merge mode: base_left keeps base entries and fills LoRA when available; lora_left keeps LoRA entries and fills base when available.",
+    )
+    parser.add_argument(
+        "--merge_key",
+        choices=("id", "repr"),
+        default="repr",
+        help="Merge key for base/lora JSONL: 'id' uses workload_id, 'repr' uses workload_repr (shape-aware).",
+    )
+    parser.add_argument(
+        "--dedupe_mode",
+        choices=("min", "keep_all"),
+        default="keep_all",
+        help="JSONL merge output mode: 'min' keeps one record per key (best latency). "
+             "'keep_all' outputs all records but uses per-key min latency for *_star fields.",
+    )
     parser.add_argument(
         "--hardware-id",
         default=None,
@@ -70,6 +94,7 @@ def main() -> None:
 
     using_dataset = args.sft_dataset_path is not None
     using_jsonl_pair = args.base_jsonl is not None or args.lora_jsonl is not None
+    using_teacher = args.teacher_jsonl is not None
 
     if using_jsonl_pair:
         if not (args.base_jsonl and args.lora_jsonl):
@@ -90,18 +115,15 @@ def main() -> None:
         requires_decode = "text" not in dataset.features
         if requires_decode:
             if not args.tokenizer_path:
-                raise ValueError("Dataset does not contain 'text'. Provide --tokenizer-path to decode input_ids.")
+                raise ValueError(
+                    "Dataset does not contain 'text'. Provide --tokenizer-path to decode input_ids "
+                    "(e.g., the tokenizer used in make_dataset.py --for_gen_best)."
+                )
             tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
         latency_field = "latency" if "latency" in dataset.features else None
     else:
         if args.tokenizer_path:
             tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-
-    output_path = Path(args.output_jsonl)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    stats: Dict[str, int] = {}
-    missing_lora = 0
 
     def parse_line(line_str: str) -> Tuple[str, str, Dict, str]:
         line_json = json.loads(line_str)
@@ -112,6 +134,41 @@ def main() -> None:
         workload = json.loads(workload_repr)
         workload_id = workload[0]
         return workload_repr, target_str, line_json, workload_id
+
+    def normalize_workload_repr(workload_repr: str) -> str:
+        try:
+            workload_obj = json.loads(workload_repr)
+        except json.JSONDecodeError:
+            return workload_repr
+        return json.dumps(workload_obj, separators=(",", ":"), ensure_ascii=True)
+
+    teacher_map = None
+    if using_teacher:
+        def build_teacher_key(line_str: str) -> Tuple[str, str]:
+            workload_repr, target_str, _, workload_id = parse_line(line_str)
+            if args.merge_key == "repr":
+                return (normalize_workload_repr(workload_repr), target_str)
+            return (workload_id, target_str)
+
+        teacher_map = {}
+        with open(args.teacher_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                rec = json.loads(line)
+                line_str = rec.get("line")
+                if not line_str:
+                    continue
+                key = build_teacher_key(line_str)
+                if key not in teacher_map:
+                    teacher_map[key] = rec
+
+    output_path = Path(args.output_jsonl)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    stats: Dict[str, int] = {}
+    missing_lora = 0
+    missing_base = 0
+    paired_count = 0
+    lora_only_count = 0
 
     def resolve_hw_info(line_str: str, base_record: Dict) -> Tuple[str, str, List[float]]:
         workload_repr, target_str, _, workload_id = parse_line(line_str)
@@ -125,9 +182,10 @@ def main() -> None:
         if emb is None:
             lookup_name = hw_name
             if lookup_name not in embeddings and hw_id in KNOWN_DEFAULTS:
-                fallback = KNOWN_DEFAULTS[hw_id]
-                if fallback in embeddings:
-                    lookup_name = fallback
+                for fallback in KNOWN_DEFAULTS[hw_id]:
+                    if fallback in embeddings:
+                        lookup_name = fallback
+                        break
             if lookup_name not in embeddings:
                 raise KeyError(f"Hardware embedding for '{hw_name}' not found in {args.embedding_json}")
             emb = embeddings[lookup_name]
@@ -170,85 +228,185 @@ def main() -> None:
                 }
                 out_f.write(json.dumps(out_record, ensure_ascii=False) + "\n")
         else:
-            def load_jsonl(path: str, is_lora: bool) -> Dict[Tuple[str, str], Dict]:
-                data: Dict[Tuple[str, str], Dict] = {}
+            collisions_by_id: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+            def record_collision(workload_id: str, target_str: str, workload_repr: str) -> None:
+                try:
+                    shapes = json.loads(workload_repr)[1:]
+                    shape_repr = json.dumps(shapes, separators=(",", ":"), ensure_ascii=True)
+                except Exception:
+                    shape_repr = workload_repr
+                bucket = collisions_by_id.setdefault((workload_id, target_str), {})
+                if workload_repr not in bucket:
+                    bucket[workload_repr] = shape_repr
+
+            def build_merge_key(workload_repr: str, workload_id: str, target_str: str) -> Tuple[str, str]:
+                if args.merge_key == "repr":
+                    return (normalize_workload_repr(workload_repr), target_str)
+                return (workload_id, target_str)
+
+            def load_jsonl(path: str, is_lora: bool):
+                best_records: Dict[Tuple[str, str], Dict] = {}
+                best_latency: Dict[Tuple[str, str], float] = {}
+                all_records: List[Tuple[Tuple[str, str], Dict]] = []
                 with open(path, "r", encoding="utf-8") as f:
                     for line in f:
                         rec = json.loads(line)
                         line_str = rec.get("line")
                         if not line_str:
                             continue
-                        _, target_str, _, workload_id = parse_line(line_str)
-                        key = (workload_id, target_str)
+                        workload_repr, target_str, _, workload_id = parse_line(line_str)
+                        norm_repr = normalize_workload_repr(workload_repr)
+                        record_collision(workload_id, target_str, norm_repr)
+                        key = build_merge_key(norm_repr, workload_id, target_str)
                         latency = rec.get("lat_lora_star" if is_lora else "lat_base_star", rec.get("latency"))
                         if latency is None:
                             continue
                         latency = float(latency)
-                        prev = data.get(key)
-                        if prev is None:
-                            data[key] = rec
-                            data[key]["_best_latency"] = latency
-                        else:
-                            if latency < prev["_best_latency"]:
-                                rec["_best_latency"] = latency
-                                data[key] = rec
-                return data
+                        all_records.append((key, rec))
+                        prev_best = best_latency.get(key)
+                        if prev_best is None or latency < prev_best:
+                            best_latency[key] = latency
+                            best_records[key] = rec
+                return best_records, all_records, best_latency
 
-            base_map = load_jsonl(args.base_jsonl, is_lora=False)
-            lora_map = load_jsonl(args.lora_jsonl, is_lora=True)
-            if not base_map:
+            base_map, base_records, base_min = load_jsonl(args.base_jsonl, is_lora=False)
+            lora_map, lora_records, lora_min = load_jsonl(args.lora_jsonl, is_lora=True)
+            if args.merge_mode == "base_left" and not base_map:
                 raise ValueError(f"No valid records found in base jsonl: {args.base_jsonl}")
-            for key, base_rec in base_map.items():
-                line_str = base_rec["line"]
-                workload_repr, target_str, line_json, _ = parse_line(line_str)
-                hw_id, hw_name, hw_emb = resolve_hw_info(line_str, base_rec)
-                if hardware_filters and hw_id not in hardware_filters:
-                    continue
+            if args.merge_mode == "lora_left" and not lora_map:
+                raise ValueError(f"No valid records found in lora jsonl: {args.lora_jsonl}")
+            if args.merge_mode == "lora_left" and not base_map:
+                print("[prepare_edge_dataset] Warning: base jsonl is empty; lat_base_star will be null for all outputs.")
 
-                lat_base = base_rec.get("lat_base_star", base_rec.get("latency"))
-                if lat_base is None:
-                    raise KeyError(f"Base record missing latency information for workload: {key}")
-                lat_base = float(lat_base)
+            collisions = [
+                (wid, target, variants) for (wid, target), variants in collisions_by_id.items() if len(variants) > 1
+            ]
+            if collisions:
+                print(
+                    f"[prepare_edge_dataset] Detected {len(collisions)} workload_id collisions (multiple shapes per id)."
+                )
+                collisions.sort(key=lambda x: len(x[2]), reverse=True)
+                for (wid, target), variants in [((w, t), v) for w, t, v in collisions[:20]]:
+                    shapes_list = list(variants.values())
+                    print(f"  - workload_id={wid} target={target} variants={len(shapes_list)} shapes={shapes_list[:6]}")
+                print(
+                    f"[prepare_edge_dataset] merge_key='{args.merge_key}'; use --merge_key=repr to avoid shape mismatches."
+                )
+            if args.merge_mode == "base_left":
+                base_iter = base_map.items() if args.dedupe_mode == "min" else base_records
+                for key, base_rec in base_iter:
+                    line_str = base_rec["line"]
+                    workload_repr, target_str, line_json, _ = parse_line(line_str)
+                    hw_id, hw_name, hw_emb = resolve_hw_info(line_str, base_rec)
+                    if hardware_filters and hw_id not in hardware_filters:
+                        continue
 
-                lora_rec = lora_map.get(key)
-                if lora_rec is not None:
-                    lat_lora = lora_rec.get("lat_lora_star", lora_rec.get("latency"))
-                    lat_lora = float(lat_lora) if lat_lora is not None else None
-                else:
-                    lat_lora = None if args.allow_missing_lora else lat_base
+                    lat_base = base_min.get(key)
+                    if lat_base is None:
+                        raise KeyError(f"Base record missing latency information for workload: {key}")
+                    lat_base = float(lat_base)
+
+                    if key in lora_min:
+                        lat_lora = float(lora_min[key])
+                        paired_count += 1
+                    else:
+                        lat_lora = None if args.allow_missing_lora else lat_base
+                        if lat_lora is None:
+                            missing_lora += 1
+
+                    text = None
+                    if teacher_map and key in teacher_map:
+                        text = teacher_map[key].get("text")
+                    if text is None:
+                        text = base_rec.get("text")
+                    if text is None:
+                        if tokenizer is None:
+                            raise ValueError("Tokenizer required to decode samples without 'text'.")
+                        input_ids = None
+                        if teacher_map and key in teacher_map:
+                            input_ids = teacher_map[key].get("input_ids")
+                        if input_ids is None:
+                            input_ids = base_rec.get("input_ids")
+                        if input_ids is None:
+                            raise ValueError("Base record missing both 'text' and 'input_ids'.")
+                        text = tokenizer.decode(input_ids, skip_special_tokens=True)
+
+                    stats[hw_id] = stats.get(hw_id, 0) + 1
+                    out_rec = {
+                        "text": text,
+                        "hardware_id": hw_id,
+                        "hardware_name": hw_name,
+                        "hw_emb": hw_emb,
+                        "lat_base_star": lat_base,
+                        "lat_lora_star": lat_lora,
+                        "line": line_str,
+                    }
+                    out_f.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
+            else:
+                lora_iter = lora_map.items() if args.dedupe_mode == "min" else lora_records
+                for key, lora_rec in lora_iter:
+                    line_str = lora_rec["line"]
+                    workload_repr, target_str, line_json, _ = parse_line(line_str)
+                    hw_id, hw_name, hw_emb = resolve_hw_info(line_str, lora_rec)
+                    if hardware_filters and hw_id not in hardware_filters:
+                        continue
+
+                    lat_lora = lora_min.get(key)
                     if lat_lora is None:
-                        missing_lora += 1
+                        continue
+                    lat_lora = float(lat_lora)
 
-                text = base_rec.get("text")
-                if text is None:
-                    if tokenizer is None:
-                        raise ValueError("Tokenizer required to decode samples without 'text'.")
-                    input_ids = base_rec.get("input_ids")
-                    if input_ids is None:
-                        raise ValueError("Base record missing both 'text' and 'input_ids'.")
-                    text = tokenizer.decode(input_ids, skip_special_tokens=True)
+                    if key in base_min:
+                        lat_base = float(base_min[key])
+                        paired_count += 1
+                    else:
+                        lat_base = None
+                        missing_base += 1
+                        lora_only_count += 1
 
-                stats[hw_id] = stats.get(hw_id, 0) + 1
-                base_rec.pop("_best_latency", None)
-                if lora_rec:
-                    lora_rec.pop("_best_latency", None)
-                out_rec = {
-                    "text": text,
-                    "hardware_id": hw_id,
-                    "hardware_name": hw_name,
-                    "hw_emb": hw_emb,
-                    "lat_base_star": lat_base,
-                    "lat_lora_star": lat_lora,
-                    "line": line_str,
-                }
-                out_f.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
+                    text = None
+                    if teacher_map and key in teacher_map:
+                        text = teacher_map[key].get("text")
+                    if text is None:
+                        text = lora_rec.get("text")
+                    if text is None:
+                        if tokenizer is None:
+                            raise ValueError("Tokenizer required to decode samples without 'text'.")
+                        input_ids = None
+                        if teacher_map and key in teacher_map:
+                            input_ids = teacher_map[key].get("input_ids")
+                        if input_ids is None:
+                            input_ids = lora_rec.get("input_ids")
+                        if input_ids is None:
+                            raise ValueError("LoRA record missing both 'text' and 'input_ids'.")
+                        text = tokenizer.decode(input_ids, skip_special_tokens=True)
+
+                    stats[hw_id] = stats.get(hw_id, 0) + 1
+                    out_rec = {
+                        "text": text,
+                        "hardware_id": hw_id,
+                        "hardware_name": hw_name,
+                        "hw_emb": hw_emb,
+                        "lat_base_star": lat_base,
+                        "lat_lora_star": lat_lora,
+                        "line": line_str,
+                    }
+                    out_f.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
 
     total_written = sum(stats.values())
     print(f"Wrote {total_written} samples to {output_path}")
     for hw_id, count in stats.items():
         print(f"  - {hw_id}: {count}")
-    if using_jsonl_pair and args.allow_missing_lora and missing_lora:
-        print(f"  Note: {missing_lora} samples are missing LoRA measurements (lat_lora_star=None).")
+    if using_jsonl_pair:
+        print(f"  paired_count={paired_count}")
+        if args.merge_mode == "base_left":
+            if args.allow_missing_lora and missing_lora:
+                print(f"  Note: {missing_lora} samples are missing LoRA measurements (lat_lora_star=None).")
+        else:
+            print(f"  lora_only_count={lora_only_count}")
+            if missing_base:
+                print(f"  Note: {missing_base} samples are missing base measurements (lat_base_star=None).")
 
 
 if __name__ == "__main__":

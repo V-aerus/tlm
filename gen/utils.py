@@ -54,7 +54,7 @@ def add_testtuning_files(file):
 def get_testtuning_files():
     return get_utils_json('testtuning_files')
 
-def get_measure_records():
+def get_measure_records(mode: str = "all"):
     from common import HARDWARE_PLATFORM
     print(f"Checking utils_json_path: {utils_json_path}")
     if not os.path.exists(utils_json_path):
@@ -65,9 +65,15 @@ def get_measure_records():
             data = json.load(f)
         print(f"Loaded utils.json: {data}")
         print(f"HARDWARE_PLATFORM: {HARDWARE_PLATFORM}")
-        if HARDWARE_PLATFORM in data and "measure_records" in data[HARDWARE_PLATFORM]:
-            print(f"Found measure_records: {data[HARDWARE_PLATFORM]['measure_records']}")
-            return data[HARDWARE_PLATFORM]["measure_records"]
+        if HARDWARE_PLATFORM in data:
+            key = "measure_records"
+            if mode == "base":
+                key = "measure_records_base"
+            elif mode == "kv_lora":
+                key = "measure_records_kv_lora"
+            if key in data[HARDWARE_PLATFORM]:
+                print(f"Found {key}: {data[HARDWARE_PLATFORM][key]}")
+                return data[HARDWARE_PLATFORM][key]
     except (FileNotFoundError, json.JSONDecodeError) as e:
         print(f"Error reading utils.json: {e}")
         return []

@@ -35,6 +35,7 @@ class GatedLoRAExpert(nn.Module, GatedExpertMixin):
         tau_init: float = 2.0,
         b_init: float = -1.0,
         init_router: Optional[torch.Tensor] = None,
+        reset_lora: bool = True,
     ):
         super().__init__()
         if lora_module is None:
@@ -58,7 +59,8 @@ class GatedLoRAExpert(nn.Module, GatedExpertMixin):
 
         self.register_buffer("tau", torch.tensor(float(tau_init), dtype=torch.float32))
 
-        self._reset_lora_parameters()
+        if reset_lora:
+            self._reset_lora_parameters()
 
     def _reset_lora_parameters(self) -> None:
         """确保 LoRA B 矩阵初始为 0，保持首轮前向稳定。"""

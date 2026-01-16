@@ -14,7 +14,7 @@ from typing import Dict, List
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 
 from modeling import (
     BasePlusExperts,
@@ -32,6 +32,7 @@ class TrainConfig:
     tokenizer_path: str
     dataset_jsonl: str
     output_dir: str
+    init_expert_dir: str = None
     batch_size: int = 4
     num_epochs: int = 1
     learning_rate: float = 5e-5
@@ -56,12 +57,21 @@ class EdgeExpertDataset(Dataset):
     def __init__(self, jsonl_path: Path, tokenizer, max_length: int):
         self.samples: List[Dict] = []
         self.hardware_ids = set()
+        def _to_float_or_nan(value) -> float:
+            if value is None:
+                return float("nan")
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                return float("nan")
+            if math.isnan(val):
+                return float("nan")
+            return val
         with jsonl_path.open("r", encoding="utf-8") as f:
             for line in f:
                 record = json.loads(line)
-                lat_lora = record.get("lat_lora_star")
-                if lat_lora is None or math.isnan(lat_lora):
-                    lat_lora = record["lat_base_star"]
+                lat_base = _to_float_or_nan(record.get("lat_base_star", record.get("latency")))
+                lat_lora = _to_float_or_nan(record.get("lat_lora_star"))
                 tokenized = tokenizer(
                     record["text"],
                     truncation=True,
@@ -75,8 +85,8 @@ class EdgeExpertDataset(Dataset):
                         "attention_mask": tokenized["attention_mask"][0],
                         "labels": tokenized["input_ids"][0].clone(),
                         "hw_emb": torch.tensor(record["hw_emb"], dtype=torch.float32),
-                        "lat_base": float(record["lat_base_star"]),
-                        "lat_lora": float(lat_lora),
+                        "lat_base": lat_base,
+                        "lat_lora": lat_lora,
                         "hardware_id": record["hardware_id"],
                         "hardware_name": record.get("hardware_name", record["hardware_id"]),
                     }
@@ -114,6 +124,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--init-expert-dir", default=None, help="Optional expert dir to resume (adapter + router).")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -140,6 +151,7 @@ def parse_args() -> TrainConfig:
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        init_expert_dir=args.init_expert_dir,
     )
 
 
@@ -161,22 +173,63 @@ def main() -> None:
     base_model.to(device)
     frozen_base = FrozenBaseWrapper(base_model)
 
+    init_router = None
+    init_beta = None
+    init_tau = None
+
     lora_model = AutoModelForCausalLM.from_pretrained(cfg.base_model_path)
-    lora_config = LoraConfig(
-        r=cfg.lora_rank,
-        lora_alpha=cfg.lora_alpha,
-        target_modules=[m.strip() for m in cfg.target_modules.split(",") if m.strip()],
-        lora_dropout=cfg.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    lora_model = get_peft_model(lora_model, lora_config)
-    lora_model.print_trainable_parameters()
+    if cfg.init_expert_dir:
+        init_dir = os.path.abspath(cfg.init_expert_dir)
+        if not os.path.isdir(init_dir):
+            raise FileNotFoundError(f"init_expert_dir not found: {init_dir}")
+        lora_model = PeftModel.from_pretrained(lora_model, init_dir, is_trainable=True)
+        if hasattr(lora_model, "print_trainable_parameters"):
+            lora_model.print_trainable_parameters()
+
+        router_path = os.path.join(init_dir, "router.json")
+        if os.path.exists(router_path):
+            with open(router_path, "r", encoding="utf-8") as rf:
+                router_state = json.load(rf)
+            if "r" in router_state:
+                init_router = torch.tensor(router_state["r"], dtype=torch.float32)
+            init_beta = router_state.get("beta")
+            init_tau = router_state.get("tau")
+        else:
+            print(f"[WARN] router.json not found in init_expert_dir: {init_dir}")
+    else:
+        lora_config = LoraConfig(
+            r=cfg.lora_rank,
+            lora_alpha=cfg.lora_alpha,
+            target_modules=[m.strip() for m in cfg.target_modules.split(",") if m.strip()],
+            lora_dropout=cfg.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        lora_model = get_peft_model(lora_model, lora_config)
+        lora_model.print_trainable_parameters()
     lora_model.to(device)
 
     delta_module = PeftDeltaWrapper(lora_model)
 
-    expert = GatedLoRAExpert(lora_module=delta_module, r_dim=len(dataset[0]["hw_emb"]))
+    r_dim = len(dataset[0]["hw_emb"])
+    if init_router is not None and init_router.numel() != r_dim:
+        print(
+            "[WARN] init router dim mismatch: "
+            f"{init_router.numel()} (router) vs {r_dim} (hw_emb). Ignore router init."
+        )
+        init_router = None
+    expert = GatedLoRAExpert(
+        lora_module=delta_module,
+        r_dim=r_dim,
+        init_router=init_router,
+        reset_lora=(cfg.init_expert_dir is None),
+    )
+    if init_beta is not None or init_tau is not None:
+        with torch.no_grad():
+            if init_beta is not None:
+                expert.beta.fill_(float(init_beta))
+            if init_tau is not None:
+                expert.tau.fill_(float(init_tau))
     expert.to(device)
     registry = ExpertRegistry()
     registry.register(cfg.adapter_name, expert)
@@ -225,16 +278,24 @@ def main() -> None:
 
             gates = expert.gating_weight(hw_emb)
             g_mean = gates.mean()
-            epsilon = 1e-6
-            I_pct = (lat_base - lat_lora) / (lat_base + epsilon)
-            gain_loss = compute_gain_loss(
-                I_pct=I_pct,
-                g_mean=g_mean,
-                step=global_step,
-                warmup_steps=cfg.warmup_steps,
-                m_target=cfg.gain_margin,
-                lambda_gain=cfg.lambda_gain,
-            )
+            paired_mask = (~torch.isnan(lat_base)) & (~torch.isnan(lat_lora))
+            paired_count = int(paired_mask.sum().item())
+            if paired_count > 0:
+                lat_base_p = lat_base[paired_mask]
+                lat_lora_p = lat_lora[paired_mask]
+                epsilon = 1e-6
+                I_pct = (lat_base_p - lat_lora_p) / (lat_base_p + epsilon)
+                g_mean_p = gates[paired_mask].mean()
+                gain_loss = compute_gain_loss(
+                    I_pct=I_pct,
+                    g_mean=g_mean_p,
+                    step=global_step,
+                    warmup_steps=cfg.warmup_steps,
+                    m_target=cfg.gain_margin,
+                    lambda_gain=cfg.lambda_gain,
+                )
+            else:
+                gain_loss = torch.zeros((), device=lat_base.device, dtype=lat_base.dtype)
 
             router_reg = l2r_reg(expert.r, cfg.lambda_router)
             entropy_loss = entropy_reg(gates, cfg.lambda_entropy)
@@ -254,13 +315,16 @@ def main() -> None:
                 "router_reg": float(router_reg.item()),
                 "entropy_reg": float(entropy_loss.item()),
                 "g_mean": float(g_mean.item()),
+                "paired_in_batch": paired_count,
             }
 
             if global_step % 50 == 0:
                 print(
                     f"epoch={epoch} step={global_step}/{total_steps} "
                     f"loss={loss.item():.4f} task={task_loss.item():.4f} "
-                    f"gain={gain_loss.item():.4f} g_mean={g_mean.item():.4f}"
+                    f"gain={gain_loss.item():.4f} router={router_reg.item():.4f} "
+                    f"entropy={entropy_loss.item():.4f} g_mean={g_mean.item():.4f} "
+                    f"paired={paired_count}"
                 )
             global_step += 1
 

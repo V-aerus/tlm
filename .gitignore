@@ -136,6 +136,7 @@ jvm/native/src/main/native/org_apache_tvm_native_c_api.h
 !default.perspectivev3
 xcuserdata/
 .pkl_memoize_*
+measured_*.pkl
 
 .emscripten*
 .m2

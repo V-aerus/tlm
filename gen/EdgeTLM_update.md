@@ -517,29 +517,41 @@ GatedExpertMixin & ExpertRegistry：✅ 很好；Mixin 里加上 gate_score、fo
 
 ### 1. 导出硬件专属训练语料
 
-`prepare_edge_dataset.py` 会读取 `all_gen_best_multi` 数据集中已有的张量句子，为样本注入硬件向量与基线延迟。建议针对每个硬件分别导出：
+`prepare_edge_dataset.py` 会为样本注入硬件向量与基线延迟。**推荐使用 `for_gen_best` 产出的 `0_merge.json`**（可保留同一 workload 的多条 PPT 示范），并用 `--dedupe_mode keep_all` 维持“示范库随迭代增长”的特性：
 
 ```bash
-# V100
+# 只拥有 base 数据时：提供空的 lora 文件 + allow-missing-lora
+touch /path/to/empty_lora.jsonl
+
+# 4090（base → edge_sft）
 python prepare_edge_dataset.py \
-  --sft-dataset-path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/multi_iterative_v1_dataset/multi_sft_dataset_iter1/all_gen_best_multi \
+  --base-jsonl /path/to/0_merge.json \
+  --lora-jsonl /path/to/empty_lora.jsonl \
+  --output-jsonl /path/to/edge_sft_4090.jsonl \
+  --merge_mode base_left \
+  --merge_key repr \
+  --dedupe_mode keep_all \
+  --hardware-id 4090 \
+  --embedding-json /path/to/hardware_embeddings_v4.json \
+  --allow-missing-lora
+
+# V100（同理）
+python prepare_edge_dataset.py \
+  --base-jsonl /path/to/0_merge.json \
+  --lora-jsonl /path/to/empty_lora.jsonl \
+  --output-jsonl /path/to/edge_sft_v100.jsonl \
+  --merge_mode base_left \
+  --merge_key repr \
+  --dedupe_mode keep_all \
   --hardware-id v100 \
-  --tokenizer-path /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/gen_tokenizer_multi_v1 \
-  --output-jsonl /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_sft_v100.jsonl
-
-# Xavier
-python prepare_edge_dataset.py ... --hardware-id xavier --output-jsonl /.../edge_sft_xavier.jsonl
-
-# RTX4090
-python prepare_edge_dataset.py ... --hardware-id 4090 --output-jsonl /.../edge_sft_4090.jsonl
-
-# Xeon
-python prepare_edge_dataset.py ... --hardware-id xeon --output-jsonl /.../edge_sft_xeon.jsonl
+  --embedding-json /path/to/hardware_embeddings_v4.json \
+  --allow-missing-lora
 ```
 
-- `--hardware-id` 支持单值或逗号分隔列表；不指定则导出所有样本。
-- 若数据集中没有原始 `text` 字段，需提供 `--tokenizer-path` 以便解码 `input_ids`。
-- 初次迭代暂无 `lat_lora_star`，脚本默认将其置为 `None`，后续训练会按冷启动策略处理。
+- `--merge_key repr` 实际使用 `(normalize(workload_repr), target_str)` 作为 key，**不会跨 target 混淆**，避免 shape 错配。
+- `--dedupe_mode keep_all` 会输出**所有**示范记录，但 `lat_*_star` 采用同 key 的最小延迟（贴近原版“示范库不断增长”的行为）。
+- 若只想保留每个 key 的单条最佳记录，可改 `--dedupe_mode min`。
+- v4 embedding 内部使用 `nvidia/rtx-4090` 命名；脚本已做 4090 ↔ rtx-4090/a40 的兼容回退。
 
 ### 2. 训练单个 LoRA 专家
 
@@ -556,6 +568,19 @@ python train_edge_expert.py \
 
 - 首轮训练建议 `lambda-gain=0` 或保留较长 `warmup_steps`，避免在缺失 `lat_lora_star` 的情况下错误驱动门控。
 - 产物包括 LoRA 适配器、`router.json`、`metrics.json`，可直接放入专家目录 (`experts/<org>/<hw>/<tag>/` )。
+- 也可使用一键脚本（支持迭代号/硬件/tag/超参覆盖）：`gen/scripts/run_train_edge_expert.sh`。
+- 若要继续训练上一轮 LoRA，可传 `--init-expert-dir` 或设置 `EDGE_INIT_EXPERT_DIR` 指向上一轮专家目录。
+- `run_train_edge_expert.sh` 默认在 `idx>0` 时回溯上一轮：
+  - 若设置 `EDGE_PREV_EXPERT_TAG`，使用该 tag；
+  - 否则若当前 tag 形如 `vN_gain`，自动回溯到 `v(N-1)_gain`（`v2_gain` 的上一轮为 `v1_init`）；
+  - 否则默认 `v1_init`。
+  如需关闭自动续训，设 `EDGE_RESUME_PREV=0`。
+- 可用 `EDGE_LORA_GAIN_MARGIN` 覆盖 `gain_margin`（默认 0.05），用于控制 gain 何时开始生效。
+- 为避免 `lat_base_star` 被历史 LoRA 测量抬高，`utils.json` 现在区分：
+  - `measure_records_base`（只存 base 测量）
+  - `measure_records_kv_lora`（只存 kv+LoRA 测量）
+  - 仍保留 `measure_records`（历史兼容）
+- `postprocess.py` 新增 `--record-mode base|kv_lora|all` 与 `--record-dir`；一键脚本已自动切换 base-only / lora-only，并生成 teacher(all)。
 
 ### 3. 确认 utils.json
 
@@ -1291,3 +1316,278 @@ bucket only（无 KV）
 bucket + KV-zero（验证实现/位置无副作用）
 
 bucket + KV-real（验证真实收益）
+
+8. 端到端系统集成（KV + LoRA 路由 + 草图自动选择）
+
+新增脚本：`gen_state_kv_lora.py`
+
+目标：
+- 将 bucket + KV 注入 与 LoRA 路由推理串起来，形成可执行的端到端通路；
+- 支持用目标硬件 embedding 自动选择“最相近可用草图硬件”；
+- 支持多 LoRA 专家路由（Top-K）。
+
+实现要点：
+- `--edge_expert_dirs` 支持多个 LoRA 专家目录；路由向量来自 `router.json`。
+- `--edge_embedding_path` 默认 v4，但旧专家 `router.json.hardware_dim=29` 时需显式传 v2（否则会报维度不匹配）。
+- `{hw}` 形式的 `--sketch_path` 将触发“自动草图硬件选择”；可用 `--sketch_hw_candidates` 限定候选集合。
+
+已知问题（待修复）：
+- 4090 v2 数据与 v1 数据对齐失败：`lat_lora_star` 与 `lat_base_star` 无法对应同一 workload。
+  当前 `prepare_edge_dataset.py` 在 JSONL merge 模式下只用 `(workload_id, target_str)` 作为 key，
+  但 `workload_id` 不含 shape，导致不同 shape 的样本被错误对齐。
+  修复思路：将 key 升级为 `workload_repr`（包含 shapes），或直接用 `line`/`workload_repr+target` 作为对齐键，
+  并用同一批 sketch/测量记录生成 v2 数据。
+
+9. 泛化硬件评测脚本（2080Ti / 3090）
+
+新增：
+- `for_gen_eval_sketch_ansor`：仅生成 **bert_base / resnet_50 / mobilenet_v2** 标准形状的评测草图。
+- `gen/scripts/run_eval_suite.sh`：一键生成四种 baseline（mix/official/4090-only/v100-only）。
+
+说明：
+- 我们的方法默认 **bucket + KV 注入 + LoRA**；官方 baseline 使用 `gen_state.py`（无 bucket/KV/LoRA）。
+- 生成产物默认落到 `$RUN_ROOT/<hw>/iter00/eval_ansor_gen/`，需要手动搬运到测量服务器。
+
+1.14、最新进展（以总结完的讨论成果为例）：
+1) 当前进展：系统已经打通，开始进入“实验与对比”阶段
+
+学生已经完成的关键进展：
+
+已经把整个 pipeline 跑通：从测量数据 → 训练 LoRA（专家）→ 混合专家推理（LoRA-mix）→ 在目标硬件上生成 schedule 并测量。
+
+目前已经有两个训练好的 LoRA 专家（锚点硬件）：
+
+4090 LoRA
+
+V100 LoRA
+
+为了验证“对新硬件的泛化”，学生目前选择了能租到的新硬件作为测试目标：
+
+3090
+
+2080 Ti
+
+当前实验主要看：在新硬件上，使用 base+单LoRA 或 LoRA-mix（混合专家） 能否超过（或接近）TLM 官方模型的 performance。
+
+2) 当前观察到的实验现象（结果不太乐观，但有信息量）
+2.1 2080 Ti 上的泛化效果
+
+测了 3 个网络（学生举例提到：BERT-base / MobileNet / ResNet 等）。
+
+以 TLM 官方模型在该硬件上的优化效果 作为 1.0 baseline（normalized）。
+
+结果：混合专家 LoRA-mix 能比单LoRA稍好，但整体仍没明显超过官方模型。
+
+在 BERT-base 上约到 0.96（提升约 9%但仍低于 1.0）
+
+在 MobileNet / 另一个网络上更差（0.95 / 0.88 级别）
+
+2.2 3090 上的泛化效果
+
+同样 3 个网络。
+
+结果类似：LoRA-mix 比单LoRA略好，但提升幅度不大，依然没超过官方 baseline。
+
+2.3 回到“训练锚点硬件”4090 上检查（应当更强）
+
+在 4090 上，你们的 LoRA 效果整体是比 base 强，且 LoRA-mix 进一步略有提升；
+
+但出现一个“离群”现象：BERT-base 的某个总体指标看起来远超 base + 远超官方模型（高出 40%+ 级别）。
+
+学生的解释/猜测：BERT-base 由很多子图组成（比如 9 张子图），其中某些 关键子图（例如 matmul）会被调用 20~30 次，如果这张关键子图被优化得特别好（比如达到 1.59x），会把端到端的总体指标显著抬高，导致“离群看起来特别夸张”。
+
+3) 学生提出的三类“原因分析”（为什么泛化没超过 TLM 官方）
+
+学生把原因归为三条主线（讨论中多次出现）：
+
+原因 A：TLM 官方模型在“相近高端 GPU”上本来就不差
+
+学生最初设想：TLM 官方模型只在 V100 上训，泛化到别的硬件会很差；
+
+但现在发现：对 3090/4090/2080Ti 这种相近 GPU，官方模型即使不“认识硬件”，也可能生成“差不多的一套 schedule”，性能仍然比较强。
+
+老师进一步强调：这可能不是“模型泛化更强”，而是最终生成的优化产物在这些相近 GPU 上本来就大差不差（因此你很难在这类硬件上用“泛化优势”打赢它）。
+
+原因 B：你们自己的 LoRA 还没收敛（测量次数不足）
+
+学生拿 TLM 论文的收敛定义做对比：论文里提到“测量每新增 2 万条，如果收益 <1% 持续 2 万条，则视为收敛”（学生用这话解释 Figure 9 里的那套 convergence/Profit 判据）。
+
+对照你们自己的收敛图：
+
+迭代到第 22 代总测量约 14 万次，但离 TLM 论文典型收敛量级（约 21 万）还有差距；
+
+在最近 3 万条测量里仍能看到 ~8% 级别的提升趋势，说明还在下降中、还没稳定。
+
+结论：你们现在可能还在“没跑够”的阶段，性能上还没到极限。
+
+原因 C：混合专家路由“分不清硬件”，权重几乎不随硬件变
+
+学生发现一个非常关键的现象：
+
+用 LoRA-mix 给 4090 做推理时，权重约：4090 专家 ~0.54，V100 专家 ~0.38，base ~0.08
+
+用 LoRA-mix 给 V100 做推理时，权重居然也差不多是这个比例（几乎不变）
+
+学生解释：这来自你们当前的 embedding 区分度不足（4090 vs V100 cosine ~0.99） + 专家参数差异（r/b/τ）：
+
+embedding 太像 → r·emb 差异很小
+
+4090 专家训练更充分/迭代更多 → r/b/τ 更“占优势”
+
+所以无论输入哪个硬件 embedding，softmax 后权重都类似 → 路由机制没体现出“硬件识别”
+
+4) 老师的核心判断：最大的问题其实是“锚点选错了”（4090 vs V100太像）
+
+老师把讨论拉回一个更 fundamental 的点：
+
+4090、3090、V100 在你们的硬件分类里没有本质区别（至少不够异构）
+→ 所以你现在做“跨硬件泛化”的实验，很可能只是测到“相近 GPU 之间 schedule 本来就接近”的现象；差几个百分点甚至可能接近实验误差、数据波动或收敛程度差异。
+
+老师提出更合理的硬件分层框架（建议作为你们选锚点/选测试集的依据）：
+
+高端 GPU（服务器/桌面强 GPU）
+
+低端/边缘 GPU（Jetson 类）
+
+高端 CPU（服务器/桌面 CPU）
+
+低端/边缘 CPU（树莓派/RK3588 等）
+
+并强调：你们方法的价值在于“少量锚点覆盖大量硬件”，因此锚点应该覆盖异构类别，而不是在同一类里挑两个很像的点。
+
+5) 学生的顾虑：如果用“非常异构”的锚点，会让 KV/aligner 显得没用、设计显得多余
+
+学生提出一个很真实的“论文叙事风险”：
+
+你们有 KV 注入 / aligner / 统化句子等设计；
+
+如果锚点选得太异构（比如 Canva/Jetson/CPU 这种），模型可能通过输入格式就能判断硬件类别，不需要 aligner 去补“被 mask 的关键硬件信息”；
+
+这样一来：
+
+性能可能更容易做得漂亮（因为官方模型跨域更差，你们更容易赢）
+
+但你们的“KV 注入 + aligner”会显得像是“可有可无”，叙事上不优雅
+
+老师的回应更偏“论文策略”：
+
+在 motivation / case study 里，你可以用 “V100 模型直接去 Jetson 会很差” 作为示例，体现跨域困难；
+
+但在真正的主要实验里，你完全可以：
+
+给边缘类硬件也训练一个锚点 LoRA（比如 Jetson Orin）
+
+再比较你们的“少锚点泛化”与对照方法
+
+你们的贡献重点应落在：一个模型承载多个硬件知识 + 对未见硬件仍可路由泛化，而不是被迫让某个子模块“必须显得必要”。
+
+6) 关于 baseline 怎么比：学生没想明白，讨论给出一个“折中可行”的方向
+
+学生的困惑非常集中、也很关键：
+
+只拿 TLM 官方 V100best 去比 Jetson/CPU：你们肯定赢，但会被 reviewer 说“不公平”
+
+如果让 TLM 按官方流程在每个硬件上都训练到收敛：
+
+成本极高（20 万测量、半个月级别）
+
+而且它 full model 参数量远大于你们 LoRA（你们约 2% 参数），性能可能也会赢你们
+
+结果叙事会变得尴尬：你们强调泛化，但单硬件最强可能打不过
+
+讨论中形成的一个 折中 baseline 方案（学生觉得“tricky 但可能是平衡点”，老师也认为可暂用）：
+
+用 TLM 官方模型（比如 V100 的）作为起点，
+
+在目标新硬件上做“有限成本的 continue training / finetune / 续训”（用你们收集到的该硬件测量数据），作为对照曲线的一条线：
+
+成本比“从头训满 20 万”小
+
+至少能回应“你有没有让它适配新域”的质疑
+
+同时不会把实验成本炸穿
+
+你们的主线仍是：你们训练少量锚点 LoRA，就能覆盖更多硬件；而 TLM 需要每个硬件都付出训练成本。
+
+7) 接下来要做的实验计划（讨论基本达成一致）
+7.1 重新确定“主图”与实验模板
+
+你们要画的主图，倾向于类似两种风格：
+
+Pruner 风格：横轴测量次数，纵轴 latency（或 normalized performance），展示随着测量增长的收敛曲线；不同方法多条曲线对比。
+
+TLM 风格：normalized performance / speedup，对多个模型、多个硬件做柱状/分布图。
+
+讨论中更倾向：先以 Pruner 那种“收敛曲线 + 多硬件网格”作为主图模板（因为你们现在已经在画 convergence 曲线了，也最能解释成本/收敛）。
+
+7.2 重新选硬件：不要再用 4090 vs V100 作为核心锚点组合
+
+下一阶段你们要做的是：锚点覆盖异构类别，比如先选两类启动：
+
+一个高端 GPU（4090 或 A100 任选其一）
+
+一个边缘 GPU（Jetson Xavier/Orin）
+
+再逐步把 CPU 类补齐（高端 CPU + 边缘 CPU）
+
+学生最后给出了一个工程上可落地的方案草案：
+
+保留当前比较成熟的 4090 LoRA
+
+再训练一个 Jetson/Heavier（学生口中的硬件）上的 LoRA
+
+泛化测试用 Orin（作为未见硬件）等
+
+7.3 明确要验证“两层泛化性”
+
+讨论中把泛化拆成两层（老师点出来后，学生明确“懂了”）：
+
+泛化层 1：多锚点共存能力
+一个统一模型/系统能同时承载多个硬件 LoRA 专家，并能通过路由把不同硬件“切开”。
+
+泛化层 2：未见硬件泛化能力
+对同一类里未训练的硬件（例如锚点是 Xavier，测试 Orin；锚点是 4090，测试 3090；锚点是高端 CPU，测试另一颗 CPU），依然能路由到合适专家并带来收益。
+
+7.4 同步要做的工程修正
+
+在推进主线实验的同时，你们也明确要“边做边修”：
+
+继续把 LoRA 训练推进到更接近收敛（测量次数增加）
+
+修 embedding 区分度不足的问题（否则 mix 权重不随硬件变）
+
+观察并解释 outlier（BERT-base 的关键子图重复调用导致端到端夸张提升）
+
+8) 学生的“新实验顾虑”也明确了（你可以直接当作下一步风险清单）
+
+锚点换成 Jetson/CPU 后，aligner/KV 注入可能显得不必要（叙事风险）
+
+TLM baseline 的公平比较很难：训满每硬件成本高且你们可能性能打不过；不训又会被说不公平
+
+路由机制目前不工作：embedding 太像导致权重不变，mix 的“硬件感知”没体现（二、 当前面临的核心问题 (Key Issues)
+通过对实验日志和 router.json 的手算分析，我们发现了以下**“反直觉”**现象及根因：
+1. 专家选择失真（Cross-Hardware Weight Anomaly）：
+    ◦ 现象：在 V100 硬件上生成时，4090 专家的权重反而比 V100 专家更高；且当切换到 4090 硬件时，两者权重几乎没有变化。
+2. 硬件嵌入（Embedding）区分度极低：
+    ◦ 根因：当前使用的 v4 版硬件向量，其 Cosine 相似度高达 0.997 以上。
+    ◦ 维度霸权：向量中的 B 段（TVM 约束维度，如最大线程数、寄存器数等）数值很大（如 16、10）但在不同 GPU 之间完全一致。这些常量维度在点积运算中占据了绝对主导，掩盖了主频、显存带宽等真正具有区分度的特征。
+3. 路由退化为“全局开关”：
+    ◦ 由于输入 h 的区分度不足，路由向量 r 的训练实际上只学到了一个“专家整体强度”，而没有学到“硬件匹配度”。
+    ◦ 这就导致了**“谁的参数幅度大谁就赢”**，而不是“谁最适合当前硬件谁就赢”。
+
+--------------------------------------------------------------------------------
+三、 诊断与改进方案 (Next Steps)
+针对上述问题，我们计划从以下维度进行优化，以实现真正的“按需路由”：
+• 特征工程优化：
+    ◦ 降维或缩放：删除或显著缩小 8~11 维（TVM 常量约束）的权重，避免其主导打分。
+    ◦ 标准化：对硬件向量进行标准化（LayerNorm 或 Z-score），平衡各维度对点积的贡献。
+• 路由打分公式改进：
+    ◦ 将目前基于点积的打分改为 余弦相似度（Cosine Similarity） 或 基于距离（Distance-based） 的打分，从而消除路由向量 r 绝对幅度的影响。
+• 强化区分性训练：
+    ◦ 引入对比学习（Contrastive Learning），强制要求专家在“原生硬件”上的得分显著高于“非原生硬件”。
+总结建议： 当前的路由机制在工程通路上已经打通（Frozen Base + Top-K 推理），但受限于硬件描述向量的特征重叠，导致路由决策对硬件差异不敏感。后续工作的重点将从“流程实现”转向“硬件语义空间建模”的精细化调整。
+💡 形象类比：现在的路由就像是在一群穿着一模一样制服（常量维度）的专家里选人，虽然他们胸前有不一样的姓名牌（微弱差异维度），但因为制服太显眼，路由最后只凭谁的个子高（向量幅度 r）来选人，而无视了他们是否真正专业对口。我们接下来的目标是让他们脱掉统一的制服，露出能体现专业特征的着装。）
+
+测量成本巨大：收敛需要很长时间，实验周期压力大
+
+当前 3090/2080Ti 的实验不容易赢：因为同类 GPU 上 TLM 方案天然就强，差距可能只在几个点内，容易被解释为误差/未收敛

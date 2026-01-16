@@ -38,6 +38,8 @@ def register_data_path(target_str):
             model = "a100"
         elif "arch=sm_70" in ts:
             model = "v100"
+        elif "arch=sm_75" in ts:
+            model = "2080"
         elif "arch=sm_72" in ts or "carmel" in ts:
             model = "xavier"
         elif "skylake-avx512" in ts or "mcpu=skylake" in ts:
@@ -138,3 +140,14 @@ def get_bert_files(target):
     files = list(set([it[2] for it in list(yield_hold_out_five_files(target, True))]))
     files.sort()
     return files
+
+
+def get_ansor_eval_files(target):
+    """Return measure record filenames for Ansor baseline networks (bert_base/resnet_50/mobilenet_v2)."""
+    selected = []
+    for workload, _, record_file, _ in yield_hold_out_five_files(target, only_bert=False):
+        if workload in ("bert_base", "resnet_50", "mobilenet_v2"):
+            selected.append(record_file)
+    selected = list(set(selected))
+    selected.sort()
+    return selected

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -28,6 +29,7 @@ class BasePlusExperts(nn.Module):
             raise TypeError("base must be an instance of FrozenBaseWrapper")
         self.base = base
         self.registry = registry
+        self._debug_topk_once = False
 
     def forward_single(
         self,
@@ -86,7 +88,7 @@ class BasePlusExperts(nn.Module):
             y_base = cached_base
 
         scores = []
-        deltas = []
+        experts = []
         names = []
 
         for name, expert in self.registry.items():
@@ -96,7 +98,7 @@ class BasePlusExperts(nn.Module):
             s = expert.gate_score(z)
             tau = tau_override if tau_override is not None else float(expert.temperature())
             scores.append(s / tau)
-            deltas.append(expert.forward_delta(x, **expert_kwargs))
+            experts.append(expert)
             names.append(name)
 
         if not scores:
@@ -120,8 +122,15 @@ class BasePlusExperts(nn.Module):
         weights = F.softmax(mask_tensor, dim=0)
 
         y = y_base
-        for idx, delta in enumerate(deltas):
-            gate = _broadcast_gate(weights[idx + 1], delta)
-            y = y + gate * delta
+        if k > 0:
+            selected_indices = torch.unique(topk_idx).tolist()
+            if os.environ.get("EDGE_EXPERT_DEBUG_TOPK") == "1" and not self._debug_topk_once:
+                selected_names = [names[idx] for idx in selected_indices]
+                print(f"[BasePlusExperts] topk_selected_indices={selected_indices} names={selected_names}")
+                self._debug_topk_once = True
+            for idx in selected_indices:
+                delta = experts[idx].forward_delta(x, **expert_kwargs)
+                gate = _broadcast_gate(weights[idx + 1], delta)
+                y = y + gate * delta
 
         return y, {"weights": weights, "names": ["BASE"] + names}
