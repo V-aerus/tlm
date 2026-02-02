@@ -48,7 +48,7 @@ class ScriptArguments:
     schedule_file_path: str = field(default=None, metadata={"help": ""})
     emit_hw_student: bool = field(default=False, metadata={"help": "Emit additional student text with hardware token placeholder"})
     hw_token_placeholder: str = field(default="[MASK]", metadata={"help": "Token placeholder used to replace hardware text"})
-    hardware_embedding_path: str = field(default="Embedding/hardware_embeddings_v4.json", metadata={"help": "Path to hardware embedding json"})
+    hardware_embedding_path: str = field(default="Embedding/hardware_embeddings_v4_universe.json", metadata={"help": "Path to hardware embedding json"})
     file_filter: str = field(default=None, metadata={"help": "Optional regex to filter input files by basename"})
 
 

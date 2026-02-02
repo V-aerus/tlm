@@ -90,6 +90,10 @@ class BasePlusExperts(nn.Module):
         scores = []
         experts = []
         names = []
+        g_scores = []
+        use_two_stage = False
+        comp_mode = None
+        comp_tau = None
 
         for name, expert in self.registry.items():
             if mask and not mask.get(name, True):
@@ -98,6 +102,15 @@ class BasePlusExperts(nn.Module):
             s = expert.gate_score(z)
             tau = tau_override if tau_override is not None else float(expert.temperature())
             scores.append(s / tau)
+            g_scores.append(torch.sigmoid(s / tau))
+            if getattr(expert, "router_two_stage", False):
+                use_two_stage = True
+            mode = getattr(expert, "router_score_mode", None)
+            if mode:
+                comp_mode = mode
+            ct = getattr(expert, "router_competition_tau", None)
+            if ct is not None:
+                comp_tau = float(ct)
             experts.append(expert)
             names.append(name)
 
@@ -105,21 +118,63 @@ class BasePlusExperts(nn.Module):
             return y_base, {"weights": torch.ones((1, y_base.size(0)), device=y_base.device), "names": ["BASE"]}
 
         stacked_scores = torch.stack(scores, dim=0)  # [E, B]
-        base_row = torch.zeros_like(stacked_scores[0:1])  # [1, B]
-        full_scores = torch.cat([base_row, stacked_scores], dim=0)  # [1+E, B]
+        if not use_two_stage and not comp_mode:
+            base_row = torch.zeros_like(stacked_scores[0:1])  # [1, B]
+            full_scores = torch.cat([base_row, stacked_scores], dim=0)  # [1+E, B]
 
-        k = min(topk, stacked_scores.size(0))
-        topk_vals, topk_idx = torch.topk(stacked_scores, k=k, dim=0)
+            k = min(topk, stacked_scores.size(0))
+            topk_vals, topk_idx = torch.topk(stacked_scores, k=k, dim=0)
 
-        mask_tensor = torch.full_like(full_scores, fill_value=-1e9)
-        mask_tensor[0] = 0.0  # BASE 通道保持 0 分
+            mask_tensor = torch.full_like(full_scores, fill_value=-1e9)
+            mask_tensor[0] = 0.0  # BASE 通道保持 0 分
 
-        batch_indices = torch.arange(full_scores.size(1), device=full_scores.device)
-        for rank in range(topk_idx.size(0)):
-            expert_indices = topk_idx[rank]
-            mask_tensor[expert_indices + 1, batch_indices] = topk_vals[rank, batch_indices]
+            batch_indices = torch.arange(full_scores.size(1), device=full_scores.device)
+            for rank in range(topk_idx.size(0)):
+                expert_indices = topk_idx[rank]
+                mask_tensor[expert_indices + 1, batch_indices] = topk_vals[rank, batch_indices]
 
-        weights = F.softmax(mask_tensor, dim=0)
+            weights = F.softmax(mask_tensor, dim=0)
+        else:
+            # Two-stage routing: strength gate (sigmoid) + competition (similarity).
+            comp_mode = comp_mode or "dot_over_rnorm"
+            comp_tau = comp_tau if comp_tau is not None else 1.0
+            g_stack = torch.stack(g_scores, dim=0)  # [E, B]
+
+            comp_scores = []
+            for expert, score in zip(experts, scores):
+                z = expert.gate_inputs(hidden_states=hidden_states, hw_emb=hw_emb)
+                r_dir = getattr(expert, "router_direction", None)
+                if callable(r_dir):
+                    r_vec = r_dir()
+                else:
+                    r_vec = getattr(expert, "r", None)
+                if r_vec is None:
+                    comp_scores.append(score)
+                    continue
+                dot = (z * r_vec).sum(dim=-1)
+                r_norm = torch.linalg.norm(r_vec)
+                if comp_mode == "cosine":
+                    h_norm = torch.linalg.norm(z, dim=-1)
+                    comp = dot / ((r_norm + 1e-6) * (h_norm + 1e-6))
+                elif comp_mode == "dot":
+                    comp = dot
+                else:
+                    comp = dot / (r_norm + 1e-6)
+                comp_scores.append(comp)
+
+            comp_stack = torch.stack(comp_scores, dim=0)  # [E, B]
+            k = min(topk, comp_stack.size(0))
+            topk_vals, topk_idx = torch.topk(comp_stack, k=k, dim=0)
+            mask_tensor = torch.full_like(comp_stack, fill_value=-1e9)
+            batch_indices = torch.arange(comp_stack.size(1), device=comp_stack.device)
+            for rank in range(topk_idx.size(0)):
+                expert_indices = topk_idx[rank]
+                mask_tensor[expert_indices, batch_indices] = topk_vals[rank, batch_indices]
+            pi = F.softmax(mask_tensor / max(comp_tau, 1e-6), dim=0)
+            w = g_stack * pi
+            base_weight = 1.0 - w.sum(dim=0)
+            base_weight = torch.clamp(base_weight, min=0.0, max=1.0)
+            weights = torch.cat([base_weight.unsqueeze(0), w], dim=0)
 
         y = y_base
         if k > 0:

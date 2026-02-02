@@ -56,8 +56,8 @@ class ScriptArguments:
     tokenizer_path: Optional[str] = field(default=None, metadata={"help": "Optional tokenizer path (defaults to model_path)"})
     adapter_path: Optional[str] = field(default=None, metadata={"help": "Optional single LoRA/PEFT adapter path"})
     hardware_embedding_path: str = field(
-        default="Embedding/hardware_embeddings_v4.json",
-        metadata={"help": "Path to hardware_embeddings_v4.json"},
+        default="Embedding/hardware_embeddings_v4_universe.json",
+        metadata={"help": "Path to hardware_embeddings_v4_universe.json"},
     )
     target_hardware: Optional[str] = field(
         default=None,

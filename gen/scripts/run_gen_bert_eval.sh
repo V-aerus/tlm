@@ -38,6 +38,8 @@ fi
 # shellcheck disable=SC1090
 source "$PATHS_SH"
 
+EDGE_EMB_PATH="${EDGE_EMB_PATH:-${HW_EMB_V4U:-$HW_EMB_V4}}"
+
 if [[ "$HW" == "4090" ]]; then
   TARGET="$TARGET_4090"
   TUNE_TARGET="4090"
@@ -75,7 +77,7 @@ if [[ ! -f "$GEN_OUT" || "${EDGE_FORCE:-0}" == "1" ]]; then
     --model_path "$BASE_CKPT" \
     --tokenizer_path "$TOKENIZER" \
     --edge_expert_dirs "$EXPERT_DIR" \
-    --edge_embedding_path "$HW_EMB_V4" \
+    --edge_embedding_path "$EDGE_EMB_PATH" \
     --sketch_path "$SKETCH_PATH" \
     --save_path "$GEN_OUT" \
     --target "$TARGET" \
@@ -84,7 +86,7 @@ if [[ ! -f "$GEN_OUT" || "${EDGE_FORCE:-0}" == "1" ]]; then
     --use_bucket \
     --use_hw_kv --hw_kv_mode real \
     --hw_kv_aligner_path "$HW_KV_ALIGNER" \
-    --hardware_embedding_path "$HW_EMB_V4" \
+    --hardware_embedding_path "$EDGE_EMB_PATH" \
     --pos_compensate \
     | tee "$LOG_DIR/gen_bert_${TAG}.log"
 else

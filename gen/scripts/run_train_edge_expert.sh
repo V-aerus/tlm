@@ -10,6 +10,10 @@ if [[ $# -lt 1 ]]; then
   echo "       EDGE_RESUME_PREV=0 (disable auto-resume from previous iter)"
   echo "       EDGE_PREV_EXPERT_TAG=v1_init (auto-resume tag when idx>0)"
   echo "       EDGE_LORA_GAIN_MARGIN=0.05 (override gain margin)"
+  echo "       EDGE_ROUTER_PREPROCESS=zscore_mask (enable routing preprocess)"
+  echo "       EDGE_ROUTER_PREPROCESS_EMB=/path/to/hardware_embeddings_v4_universe.json"
+  echo "       EDGE_ROUTER_PREPROCESS_JSON=/path/to/preprocess_v4u_zscore_v1.json"
+  echo "       EDGE_TRAIN_ROUTER_ONLY=1 (freeze LoRA, train router only)"
   exit 1
 fi
 
@@ -37,7 +41,7 @@ fi
 ITER=$(printf "iter%02d" "$IDX")
 HW="${2:-${EDGE_HW:-4090}}"
 TAG="${3:-${EDGE_EXPERT_TAG:-v1_init}}"
-CUDA_ID="${EDGE_CUDA:-3}"
+CUDA_ID="${EDGE_CUDA:-0}"
 
 DATASET="${EDGE_DATASET_JSONL:-$RUN_ROOT/${HW}/${ITER}/sft/edge_sft_${HW}.jsonl}"
 OUT_DIR="${EDGE_EXPERT_OUT_DIR:-$RUN_ROOT/${HW}/${ITER}/experts/${TAG}}"
@@ -72,6 +76,17 @@ ALPHA="${EDGE_LORA_ALPHA:-32}"
 DROPOUT="${EDGE_LORA_DROPOUT:-0.05}"
 MAXLEN="${EDGE_LORA_MAXLEN:-512}"
 GRAD_CLIP="${EDGE_LORA_GRAD_CLIP:-1.0}"
+ROUTER_PREPROCESS="${EDGE_ROUTER_PREPROCESS:-identity}"
+ROUTER_PREPROCESS_EMB="${EDGE_ROUTER_PREPROCESS_EMB:-}"
+ROUTER_PREPROCESS_JSON="${EDGE_ROUTER_PREPROCESS_JSON:-}"
+if [[ -n "$ROUTER_PREPROCESS_JSON" ]]; then
+  ROUTER_PREPROCESS_EMB=""
+fi
+ROUTER_PREPROCESS_STD_FLOOR="${EDGE_ROUTER_PREPROCESS_STD_FLOOR:-1e-3}"
+ROUTER_PREPROCESS_CLIP="${EDGE_ROUTER_PREPROCESS_CLIP:-5.0}"
+ROUTER_PREPROCESS_MASK_MODE="${EDGE_ROUTER_PREPROCESS_MASK_MODE:-zero}"
+ROUTER_PREPROCESS_FALLBACK_DIM="${EDGE_ROUTER_PREPROCESS_FALLBACK_DIM:-4}"
+TRAIN_ROUTER_ONLY="${EDGE_TRAIN_ROUTER_ONLY:-0}"
 INIT_EXPERT_DIR="${EDGE_INIT_EXPERT_DIR:-}"
 RESUME_PREV="${EDGE_RESUME_PREV:-1}"
 if [[ -z "$INIT_EXPERT_DIR" && "$IDX" -gt 0 && "$RESUME_PREV" == "1" ]]; then
@@ -150,5 +165,13 @@ CUDA_VISIBLE_DEVICES="$CUDA_ID" python "$TLM_ROOT/gen/train_edge_expert.py" \
   --lora-dropout "$DROPOUT" \
   --max-length "$MAXLEN" \
   --gradient-clip "$GRAD_CLIP" \
+  --router-preprocess "$ROUTER_PREPROCESS" \
+  ${ROUTER_PREPROCESS_JSON:+--router-preprocess-json "$ROUTER_PREPROCESS_JSON"} \
+  ${ROUTER_PREPROCESS_EMB:+--router-preprocess-embeddings "$ROUTER_PREPROCESS_EMB"} \
+  --router-preprocess-std-floor "$ROUTER_PREPROCESS_STD_FLOOR" \
+  --router-preprocess-clip "$ROUTER_PREPROCESS_CLIP" \
+  --router-preprocess-mask-mode "$ROUTER_PREPROCESS_MASK_MODE" \
+  --router-preprocess-fallback-dim "$ROUTER_PREPROCESS_FALLBACK_DIM" \
+  $( [[ "$TRAIN_ROUTER_ONLY" == "1" ]] && echo "--train-router-only" ) \
   "${INIT_EXPERT_ARGS[@]}" \
   | tee "$LOG_FILE"

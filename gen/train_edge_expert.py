@@ -9,7 +9,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -24,6 +24,7 @@ from modeling import (
     PeftDeltaWrapper,
 )
 from training import compute_gain_loss, compute_task_loss, entropy_reg, l2r_reg
+from modeling.hw_preprocess import build_preprocess_params, summarize_preprocess
 
 
 @dataclass
@@ -51,6 +52,14 @@ class TrainConfig:
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
+    router_preprocess: str = "identity"
+    router_preprocess_embeddings: str = ""
+    router_preprocess_json: str = ""
+    router_preprocess_std_floor: float = 1e-3
+    router_preprocess_clip: float = 5.0
+    router_preprocess_mask_mode: str = "zero"
+    router_preprocess_fallback_dim: int = 4
+    train_router_only: bool = False
 
 
 class EdgeExpertDataset(Dataset):
@@ -125,6 +134,25 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--init-expert-dir", default=None, help="Optional expert dir to resume (adapter + router).")
+    parser.add_argument("--router-preprocess", default="identity", choices=["identity", "zscore_mask"])
+    parser.add_argument(
+        "--router-preprocess-embeddings",
+        default="",
+        help=(
+            "Path to embeddings JSON for preprocess stats. If you already have a fixed preprocess, "
+            "prefer --router-preprocess-json to avoid re-computing stats."
+        ),
+    )
+    parser.add_argument(
+        "--router-preprocess-json",
+        default="",
+        help="Path to fixed preprocess JSON (preferred; avoids re-computing stats).",
+    )
+    parser.add_argument("--router-preprocess-std-floor", type=float, default=1e-3)
+    parser.add_argument("--router-preprocess-clip", type=float, default=5.0)
+    parser.add_argument("--router-preprocess-mask-mode", default="zero", choices=["zero", "keep_raw"])
+    parser.add_argument("--router-preprocess-fallback-dim", type=int, default=4)
+    parser.add_argument("--train-router-only", action="store_true")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -152,7 +180,53 @@ def parse_args() -> TrainConfig:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         init_expert_dir=args.init_expert_dir,
+        router_preprocess=args.router_preprocess,
+        router_preprocess_embeddings=args.router_preprocess_embeddings,
+        router_preprocess_json=args.router_preprocess_json,
+        router_preprocess_std_floor=args.router_preprocess_std_floor,
+        router_preprocess_clip=args.router_preprocess_clip,
+        router_preprocess_mask_mode=args.router_preprocess_mask_mode,
+        router_preprocess_fallback_dim=args.router_preprocess_fallback_dim,
+        train_router_only=args.train_router_only,
     )
+
+
+def _load_embedding_vectors(path: Path) -> List[List[float]]:
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    return [e["vector"] for e in entries if "vector" in e]
+
+
+def _read_preprocess_json(path: Path) -> Optional[Dict]:
+    if not path.exists():
+        return None
+    try:
+        params = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(params, dict):
+        return None
+    # Basic sanity check
+    if "mean" in params and "std" in params and "mask" in params:
+        params.setdefault("source", str(path))
+        return params
+    return None
+
+
+def _resolve_preprocess_source(cfg: TrainConfig) -> Optional[Path]:
+    if cfg.router_preprocess == "identity":
+        return None
+    if cfg.router_preprocess_json:
+        return Path(cfg.router_preprocess_json)
+    if cfg.router_preprocess_embeddings:
+        return Path(cfg.router_preprocess_embeddings)
+    default_params = Path("gen/Embedding/preprocess_v4u_zscore_v1.json")
+    if default_params.exists():
+        return default_params
+    default_universe = Path("gen/Embedding/hardware_embeddings_v4_universe.json")
+    if default_universe.exists():
+        return default_universe
+    default_v4 = Path("gen/Embedding/hardware_embeddings_v4.json")
+    return default_v4 if default_v4.exists() else None
 
 
 def main() -> None:
@@ -174,8 +248,10 @@ def main() -> None:
     frozen_base = FrozenBaseWrapper(base_model)
 
     init_router = None
+    init_scale = None
     init_beta = None
     init_tau = None
+    init_preprocess = None
 
     lora_model = AutoModelForCausalLM.from_pretrained(cfg.base_model_path)
     if cfg.init_expert_dir:
@@ -192,8 +268,10 @@ def main() -> None:
                 router_state = json.load(rf)
             if "r" in router_state:
                 init_router = torch.tensor(router_state["r"], dtype=torch.float32)
+            init_scale = router_state.get("s")
             init_beta = router_state.get("beta")
             init_tau = router_state.get("tau")
+            init_preprocess = router_state.get("meta", {}).get("preprocess")
         else:
             print(f"[WARN] router.json not found in init_expert_dir: {init_dir}")
     else:
@@ -218,10 +296,14 @@ def main() -> None:
             f"{init_router.numel()} (router) vs {r_dim} (hw_emb). Ignore router init."
         )
         init_router = None
+        init_scale = None
+    if init_scale is None and init_router is not None:
+        init_scale = float(torch.linalg.norm(init_router).item())
     expert = GatedLoRAExpert(
         lora_module=delta_module,
         r_dim=r_dim,
         init_router=init_router,
+        init_scale=init_scale,
         reset_lora=(cfg.init_expert_dir is None),
     )
     if init_beta is not None or init_tau is not None:
@@ -230,18 +312,53 @@ def main() -> None:
                 expert.beta.fill_(float(init_beta))
             if init_tau is not None:
                 expert.tau.fill_(float(init_tau))
+
+    preprocess_params = None
+    preprocess_source = _resolve_preprocess_source(cfg)
+    if cfg.router_preprocess != "identity":
+        if preprocess_source is None or not preprocess_source.exists():
+            raise FileNotFoundError(
+                "router preprocess requires params or embeddings, "
+                f"but not found: {preprocess_source}"
+            )
+        preprocess_params = _read_preprocess_json(preprocess_source)
+        if preprocess_params is None:
+            vectors = _load_embedding_vectors(preprocess_source)
+            preprocess_params = build_preprocess_params(
+                vectors,
+                preprocess_type=cfg.router_preprocess,
+                std_floor=cfg.router_preprocess_std_floor,
+                clip=cfg.router_preprocess_clip,
+                mask_mode=cfg.router_preprocess_mask_mode,
+                fallback_min_dim=cfg.router_preprocess_fallback_dim,
+                source=str(preprocess_source),
+            )
+            source_kind = "embeddings"
+        else:
+            source_kind = "json"
+        print(f"[CONFIG] router preprocess ({source_kind}): {summarize_preprocess(preprocess_params)}")
+        if init_preprocess and init_preprocess != preprocess_params:
+            print("[WARN] init_expert_dir preprocess meta differs from current config.")
+    expert.set_hw_preprocess(preprocess_params)
     expert.to(device)
     registry = ExpertRegistry()
     registry.register(cfg.adapter_name, expert)
     system = BasePlusExperts(frozen_base, registry)
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": [p for p in lora_model.parameters() if p.requires_grad], "lr": cfg.learning_rate},
-            {"params": [expert.r, expert.beta], "lr": cfg.router_learning_rate},
-        ],
-        weight_decay=cfg.weight_decay,
-    )
+    if cfg.train_router_only:
+        for p in lora_model.parameters():
+            p.requires_grad = False
+        trainable_lora = []
+        print("[CONFIG] train_router_only=1 (LoRA frozen)")
+    else:
+        trainable_lora = [p for p in lora_model.parameters() if p.requires_grad]
+
+    param_groups = []
+    if trainable_lora:
+        param_groups.append({"params": trainable_lora, "lr": cfg.learning_rate})
+    param_groups.append({"params": [expert.r, expert.scale, expert.beta], "lr": cfg.router_learning_rate})
+
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
 
     global_step = 0
     total_steps = len(dataloader) * cfg.num_epochs
@@ -250,7 +367,10 @@ def main() -> None:
     last_metrics: Dict[str, float] = {}
 
     for epoch in range(cfg.num_epochs):
-        lora_model.train()
+        if cfg.train_router_only:
+            lora_model.eval()
+        else:
+            lora_model.train()
         expert.train()
         for batch in dataloader:
             optimizer.zero_grad()
@@ -332,22 +452,28 @@ def main() -> None:
     lora_model.save_pretrained(cfg.output_dir)
     tokenizer.save_pretrained(cfg.output_dir)
 
+    router_meta = {
+        "hardware_ids": hardware_ids,
+        "train_samples": len(dataset),
+        "num_epochs": cfg.num_epochs,
+        "batch_size": cfg.batch_size,
+        "warmup_steps": cfg.warmup_steps,
+        "gain_margin": cfg.gain_margin,
+        "router_param": "s_norm",
+    }
+    if preprocess_params:
+        router_meta["preprocess"] = preprocess_params
+
     router_info = {
         "hardware_dim": len(dataset[0]["hw_emb"]),
         "r": expert.r.detach().cpu().tolist(),
+        "s": float(expert.router_scale().detach().cpu()),
         "beta": float(expert.beta.detach().cpu()),
         "tau": float(expert.tau.detach().cpu()),
         "lambda_router": cfg.lambda_router,
         "lambda_entropy": cfg.lambda_entropy,
         "lambda_gain": cfg.lambda_gain,
-        "meta": {
-            "hardware_ids": hardware_ids,
-            "train_samples": len(dataset),
-            "num_epochs": cfg.num_epochs,
-            "batch_size": cfg.batch_size,
-            "warmup_steps": cfg.warmup_steps,
-            "gain_margin": cfg.gain_margin,
-        },
+        "meta": router_meta,
     }
     with open(os.path.join(cfg.output_dir, "router.json"), "w", encoding="utf-8") as f:
         json.dump(router_info, f, indent=2)

@@ -4,6 +4,8 @@ set -euo pipefail
 DRY_RUN=0
 SKIP_GEN="${EDGE_SKIP_GEN:-0}"
 SKIP_MEASURE="${EDGE_SKIP_MEASURE:-0}"
+SKIP_TRAIN="${EDGE_SKIP_TRAIN:-0}"
+SKIP_SKETCH="${EDGE_SKIP_SKETCH:-0}"
 ARGS=()
 for arg in "$@"; do
   if [[ "$arg" == "--dry-run" ]]; then
@@ -22,6 +24,7 @@ if [[ $# -lt 1 ]]; then
   echo "  stage: numeric stage for gain training (default: EDGE_STAGE or 2)"
   echo "  --dry-run: only check missing artifacts, no commands executed"
   echo "Note: This script skips base generation/measurement steps."
+  echo "      Set EDGE_SKIP_SKETCH=1 to skip sketch creation."
   exit 1
 fi
 
@@ -44,6 +47,8 @@ fi
 
 # shellcheck disable=SC1090
 source "$PATHS_SH"
+
+EDGE_EMB_JSON="${EDGE_EMB_JSON:-${HW_EMB_V4U:-$HW_EMB_V4}}"
 
 ITER=$(printf "iter%02d" "$IDX")
 GAIN_TAG="${EDGE_GAIN_TAG:-v${STAGE}_gain}"
@@ -91,7 +96,9 @@ run_cmd() {
 }
 
 echo "[STEP] Ensure sketch"
-if [[ ! -s "$RUN_ROOT/${HW}/${ITER}/sketch/0_merge.json" ]]; then
+if [[ "$SKIP_SKETCH" == "1" ]]; then
+  echo "Skip sketch (EDGE_SKIP_SKETCH=1)."
+elif [[ ! -s "$RUN_ROOT/${HW}/${ITER}/sketch/0_merge.json" ]]; then
   run_cmd bash "$TLM_ROOT/gen/scripts/run_train_sketch.sh" "$IDX" "$HW"
 fi
 
@@ -106,17 +113,22 @@ if [[ -n "$ITER_LIST" ]]; then
 elif [[ -n "$ITER_MAX" ]]; then
   POSTPROCESS_FILTER_ARGS+=(--iter-max "$ITER_MAX")
 fi
+POSTPROCESS_QUIET_ARGS=()
+if [[ "${EDGE_QUIET:-0}" == "1" ]]; then
+  POSTPROCESS_QUIET_ARGS+=(--quiet)
+fi
 CLEAN_OUTPUT="${EDGE_CLEAN_OUTPUT:-0}"
 if [[ "$CLEAN_OUTPUT" == "1" ]]; then
   POSTPROCESS_FILTER_ARGS+=(--clean-output)
 fi
 FORCE_PREPARE="${EDGE_FORCE_PREPARE:-0}"
+FORCE_MAKE="${EDGE_FORCE_MAKE:-0}"
 
 echo "[STEP] postprocess (base)"
-run_cmd python "$TLM_ROOT/gen/postprocess.py" --target "$TARGET" --record-mode base --record-dir "$BASE_RECORD_DIR" "${POSTPROCESS_FILTER_ARGS[@]}"
+run_cmd python "$TLM_ROOT/gen/postprocess.py" --target "$TARGET" --record-mode base --record-dir "$BASE_RECORD_DIR" "${POSTPROCESS_QUIET_ARGS[@]}" "${POSTPROCESS_FILTER_ARGS[@]}"
 
 echo "[STEP] Base SFT (for_gen_best -> edge_sft)"
-if [[ ! -s "$BASE_SFT_DIR/0_merge.json" ]]; then
+if [[ "$FORCE_MAKE" == "1" || ! -s "$BASE_SFT_DIR/0_merge.json" ]]; then
   run_cmd mkdir -p "$BASE_SFT_DIR"
   run_cmd python "$TLM_ROOT/gen/make_dataset.py" \
     --for_type=for_gen_best \
@@ -167,12 +179,25 @@ else
 fi
 
 echo "[STEP] postprocess (kv_lora)"
-run_cmd python "$TLM_ROOT/gen/postprocess.py" --target "$TARGET" --record-mode kv_lora --record-dir "$LORA_RECORD_DIR" "${POSTPROCESS_FILTER_ARGS[@]}"
+run_cmd python "$TLM_ROOT/gen/postprocess.py" --target "$TARGET" --record-mode kv_lora --record-dir "$LORA_RECORD_DIR" "${POSTPROCESS_QUIET_ARGS[@]}" "${POSTPROCESS_FILTER_ARGS[@]}"
 echo "[STEP] postprocess (all)"
-run_cmd python "$TLM_ROOT/gen/postprocess.py" --target "$TARGET" --record-mode all --record-dir "$ALL_RECORD_DIR" "${POSTPROCESS_FILTER_ARGS[@]}"
+run_cmd python "$TLM_ROOT/gen/postprocess.py" --target "$TARGET" --record-mode all --record-dir "$ALL_RECORD_DIR" "${POSTPROCESS_QUIET_ARGS[@]}" "${POSTPROCESS_FILTER_ARGS[@]}"
+
+count_json_files() {
+  local dir="$1"
+  shopt -s nullglob
+  local files=("$dir"/*.json)
+  shopt -u nullglob
+  echo "${#files[@]}"
+}
+
+LORA_JSON_COUNT="$(count_json_files "$LORA_RECORD_DIR")"
+if [[ "$LORA_JSON_COUNT" -eq 0 ]]; then
+  echo "[WARN] No kv_lora records found; skip LoRA SFT/merge and reuse base dataset."
+fi
 
 echo "[STEP] LoRA SFT + merge"
-if [[ ! -s "$LORA_SFT_DIR/0_merge.json" ]]; then
+if [[ "$LORA_JSON_COUNT" -gt 0 && ( "$FORCE_MAKE" == "1" || ! -s "$LORA_SFT_DIR/0_merge.json" ) ]]; then
   run_cmd mkdir -p "$LORA_SFT_DIR"
   run_cmd python "$TLM_ROOT/gen/make_dataset.py" \
     --for_type=for_gen_best \
@@ -183,7 +208,7 @@ if [[ ! -s "$LORA_SFT_DIR/0_merge.json" ]]; then
 fi
 
 TEACHER_SFT_DIR="$RUN_ROOT/${HW}/${ITER}/sft/teacher"
-if [[ ! -s "$TEACHER_SFT_DIR/0_merge.json" ]]; then
+if [[ "$FORCE_MAKE" == "1" || ! -s "$TEACHER_SFT_DIR/0_merge.json" ]]; then
   run_cmd mkdir -p "$TEACHER_SFT_DIR"
   run_cmd python "$TLM_ROOT/gen/make_dataset.py" \
     --for_type=for_gen_best \
@@ -203,11 +228,11 @@ if [[ "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_BASE" ]]; then
     --merge_key repr \
     --dedupe_mode keep_all \
     --hardware-id "$HW" \
-    --embedding-json "$HW_EMB_V4" \
+    --embedding-json "$EDGE_EMB_JSON" \
     --allow-missing-lora
 fi
 
-if [[ "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_LORA" ]]; then
+if [[ "$LORA_JSON_COUNT" -gt 0 && ( "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_LORA" ) ]]; then
   run_cmd touch "$RUN_ROOT/${HW}/${ITER}/sft/empty_base.jsonl"
   run_cmd python "$TLM_ROOT/gen/prepare_edge_dataset.py" \
     --base-jsonl "$RUN_ROOT/${HW}/${ITER}/sft/empty_base.jsonl" \
@@ -218,10 +243,10 @@ if [[ "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_LORA" ]]; then
     --merge_key repr \
     --dedupe_mode keep_all \
     --hardware-id "$HW" \
-    --embedding-json "$HW_EMB_V4"
+    --embedding-json "$EDGE_EMB_JSON"
 fi
 
-if [[ "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_MERGED" ]]; then
+if [[ "$LORA_JSON_COUNT" -gt 0 && ( "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_MERGED" ) ]]; then
   run_cmd python "$TLM_ROOT/gen/prepare_edge_dataset.py" \
     --base-jsonl "$EDGE_SFT_BASE" \
     --lora-jsonl "$EDGE_SFT_LORA" \
@@ -230,7 +255,17 @@ if [[ "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_MERGED" ]]; then
     --merge_key repr \
     --merge_mode lora_left \
     --dedupe_mode keep_all \
-    --embedding-json "$HW_EMB_V4"
+    --embedding-json "$EDGE_EMB_JSON"
+fi
+if [[ "$LORA_JSON_COUNT" -eq 0 ]]; then
+  if [[ "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_MERGED" ]]; then
+    run_cmd cp "$EDGE_SFT_BASE" "$EDGE_SFT_MERGED"
+  fi
+fi
+
+if [[ "$SKIP_TRAIN" == "1" ]]; then
+  echo "Skip gain expert training (EDGE_SKIP_TRAIN=1)."
+  exit 0
 fi
 
 echo "[STEP] Train gain expert"

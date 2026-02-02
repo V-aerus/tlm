@@ -61,6 +61,8 @@ fi
 # shellcheck disable=SC1090
 source "$PATHS_SH"
 
+EDGE_EMB_PATH="${EDGE_EMB_PATH:-${HW_EMB_V4U:-$HW_EMB_V4}}"
+
 EXPERT_4090="${EDGE_EXPERT_4090:-}"
 EXPERT_V100="${EDGE_EXPERT_V100:-}"
 if [[ -z "$EXPERT_4090" || -z "$EXPERT_V100" ]]; then
@@ -163,8 +165,8 @@ run_kv_lora() {
       --edge_expert_dirs "$experts" \
       --edge_topk "$topk" \
       --edge_debug_topk \
-      --edge_embedding_path "$HW_EMB_V4" \
-      --hardware_embedding_path "$HW_EMB_V4" \
+      --edge_embedding_path "$EDGE_EMB_PATH" \
+      --hardware_embedding_path "$EDGE_EMB_PATH" \
       --sketch_path "$SKETCH_PATH" \
       --save_path "$out" \
       --target "$TARGET" \
@@ -183,8 +185,8 @@ run_kv_lora() {
     --tokenizer_path "$TOKENIZER" \
     --edge_expert_dirs "$experts" \
     --edge_topk "$topk" \
-    --edge_embedding_path "$HW_EMB_V4" \
-    --hardware_embedding_path "$HW_EMB_V4" \
+    --edge_embedding_path "$EDGE_EMB_PATH" \
+    --hardware_embedding_path "$EDGE_EMB_PATH" \
     --sketch_path "$SKETCH_PATH" \
     --save_path "$out" \
     --target "$TARGET" \

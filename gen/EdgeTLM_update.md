@@ -1591,3 +1591,141 @@ TLM baseline 的公平比较很难：训满每硬件成本高且你们可能性�
 测量成本巨大：收敛需要很长时间，实验周期压力大
 
 当前 3090/2080Ti 的实验不容易赢：因为同类 GPU 上 TLM 方案天然就强，差距可能只在几个点内，容易被解释为误差/未收敛
+
+LoRA Routing / Embedding Preprocess：从 pipeline 跑通到发现问题、再到当前方案演进
+1) Pipeline 跑通后的第一轮现象：相似 GPU 上对比价值不高
+
+我们最初把 2080Ti / 3090 作为“陌生硬件泛化目标”来做对比，但实际发现：同簇 GPU 上 TLM 本身就很强，性能差距可能只在几个点以内，很难形成清晰对照，也不利于把“routing/embedding 的贡献”讲清楚。
+
+同时我们意识到：当前已训练的两个 LoRA anchor（4090 / V100）选得不理想——它们在我们设计的 embedding 空间里过于接近（或处于同一类形态），导致 routing 很难体现“硬件感知”。
+
+2) 关键问题浮现：routing 机制“不工作”，权重几乎不随硬件变化
+
+主要症状：对不同硬件输入，softmax 权重变化很小，或出现“v100 输入仍偏向 4090 expert”这类不符合直觉的现象。
+
+初步原因猜测：
+
+硬件 embedding 的可分性弱：许多维度在 GPU 内几乎不变（“常数段/近似常数段”），导致 dot 分数被这些维度主导。
+
+每个 expert 的路由向量 r 缺乏可比性（无锚点）：在“单硬件数据训练 router”的设定下，r 很容易学成“把门开大”的尺度放大器（r 范数更大 → 更容易赢），而不是学成“区分方向”的匹配器。
+
+评分函数用 dot 会把 routing 推向“选更强硬件/更大数值”的方向，而不是“选更匹配的硬件”。
+
+3) A 级最小侵入改动：只改 routing 侧 embedding preprocess（不动 KV / 不重导数据）
+
+为避免牵一发而动全身（KV aligner、注入链路、数据重导、已有 LoRA 知识都可能受影响），我们确定了 A 级修改原则：
+
+数据不重导、原 v4 embedding 文件不改、KV 侧不动
+
+仅在 routing 计算分数 前做统一 preprocess，并确保 训练/推理一致
+
+旧 router 若无 preprocess meta，则要有 identity fallback（并提示警告/不允许混合时默认报错）
+
+落地实现演进：
+
+新增 embedding universe：hardware_embeddings_v4_universe.json
+用于计算 preprocess 的 mean/std/mask，解决“训练数据里硬件种类太少 → std≈0 → z-score 不稳定”的风险。
+
+preprocess 采用 zscore_mask，并加入保护：
+
+std_floor + mask + clip + fallback(identity)（有效维度过少直接回退）
+
+router.json 写入 meta.preprocess（type/source/std_floor/clip/mask_nonzero…）
+
+混合专家时做一致性检查：preprocess 不一致默认报错，需显式 --allow-mixed-preprocess 才放行（并各用各的 preprocess 计算）
+
+4) 预览结果：preprocess 确实提升了 embedding 的区分度，但 routing 仍可能偏置
+
+我们用脚本预览到的趋势是明确的：
+
+preprocess 前：GPU embedding cosine 非常接近（例如 4090 vs v100 接近 1）
+
+preprocess 后：cosine 明显拉开（例如 4090 vs v100 从 ~0.997 降到 ~0.78，且部分组合甚至变负），说明 embedding 的“区分信号”被放大了。
+
+但 routing 验收中仍出现关键现象：
+
+dot 模式下：v100 输入可能仍偏向 4090 expert
+根因经诊断更偏向：r 的范数差异主导（||r4090|| > ||rv100||），再叠加 r 方向高度相似（cos(r4090, rv100)≈0.95+），使得“谁 r 大谁赢”。
+
+我们做了 score_mode 对照：
+
+dot：不满足目标（尺度主导）
+
+dot_over_rnorm：能让“各自硬件更偏向自己 expert”，但分离度很小、稳定性一般
+
+cosine：更趋近平局，分离度更弱
+
+5) 当前结论：问题不在 preprocess 是否生效，而在“dot 路由”的可比性与目标错位
+
+已确认的关键发现：
+
+h（embedding）差异是存在的（某些维度差异很大），但 dot 的主导维度往往落在“常数段/弱区分段”，导致差异没有变成稳定的排序翻转。
+
+r 向量在不同 expert 之间 方向高度相似，主要差别来自 尺度/范数；在单硬件训练条件下这是“天然会发生”的不可辨识问题：router 更容易学“开门变大”而不是学“匹配方向”。
+
+6) 待做测试与下一步路线（从最小侵入到结构性修改）
+
+我们接下来要做的，是把 routing 的目标从“分数更大”对齐到“匹配更像”：
+
+（A+）仍属低侵入：在推理侧采用去尺度 score + 可控温度
+
+固定 score_mode=dot_over_rnorm，并加一个 temperature/scale 放大差异（注意：这只能放大“已有差异”，不能创造方向差异）。
+
+验收标准从单次输出改为：在多 target、多次运行下仍稳定满足“各自硬件选自己 expert”的胜出关系。
+
+（B）训练侧加入 r 的范数锚点/约束（让不同 expert 可比）
+
+训练时对 r 加正则/weight_norm，使不同 expert 的 r 范数收敛到相近尺度，避免“门开大就赢”。
+
+这比纯推理归一化更干净：推理逻辑保持简单，但训练要增加约束项与监控。
+
+（C）原型相似度/CLiTE 风格：把 routing 改成“相似度匹配”
+
+为每个 expert 定义一个原型 p_i（可用 emb 初始化/簇均值初始化），用 cos(h, p_i) 或 -||h-p_i|| 做路由分数，再叠加可学习强度标量。
+
+目标显式变成“选更像的”，避免 dot 的“越大越赢”偏置。
+
+以上三条路线可以并行做小实验：先用 A+ 快速稳定住行为，再决定是否上 B/C 做结构性解释更强的版本。
+
+--------------------------------------------------------------------------------
+四、Emb v4_universe 迁移进度 & Router-only/Aligner 现状
+
+迁移目标：统一 hw_emb 坐标系（v4_universe + 固化 preprocess），保证数据生成、路由、KV 注入与推理一致。
+我们此前定义了 7 步迁移路径（略）：
+1) 统一 canonical embedding（v4_universe 作为 raw 真值）
+2) 统一 preprocess 版本（固定 mean/std/mask/clip）
+3) Router 侧 preprocess 对齐（训练/推理一致）
+4) KV Aligner 侧 preprocess 对齐（训练/推理一致）
+5) Router-only 校准
+6) KV Aligner 重训
+7) 推理回归与验收
+
+当前进度：已进入第 3~4 步，并开始并行执行第 5~6 步（router-only 重训 + aligner 重训）。
+
+Router-only 现象（校准后两次推理）：
+- base 权重偏高（g_total 约 0.40~0.46）
+- 竞争分布过尖（π 接近一边倒）
+- 旧路由几乎不区分（r 方向高度相似），新路由区分过强（r 方向近乎相反）
+
+结论：问题不在 preprocess，而在 router-only 训练目标“只学分开、不学强度”，再叠加正则导致 g 被动变小。
+
+因此我们新增 4 项训练内改动（不手调 router.json）：
+1) 强度监督（g*）：根据 I_pct 自动构造 g_target，显式监督 g_label，避免 base 权重过大。
+2) 竞争平滑：对 π 增加熵正则或 label smoothing，防止分布过尖。
+3) 可训练 T_comp：引入 competition_tau 的可训练参数，并对其加入弱先验，交由数据决定“分得多尖”。
+4) 路由参数解耦：r = s * normalize(p)，方向负责分离、强度由 s/b 负责开门；避免 L2 把 g 顺手压小。
+
+上述改动已落地到 router-only 训练与推理加载逻辑中，后续以训练结果为准，不再依赖手动调整 router.json。
+
+补充：router-only 校准默认参数（已写死到训练脚本）
+- g* 目标锚点固定为 0，尺度用 IQR（稳健尺度）；即 g_target = sigmoid(I_pct / (IQR * scale))。
+- competition_tau 默认固定为 1.0（不训练）；如需训练需显式开启，并加强先验正则（默认 reg=0.1）。
+- π 平滑默认启用：lambda_pi_entropy=0.12，label_smoothing=0.1。
+（对应脚本：gen/train_router_calibration.py）
+
+补充验证（Arch swap sanity）：
+- 在同一条 workload 上，仅替换 text_full 中的 `-arch=sm_86` → `-arch=sm_70`，其余保持不变。
+- 使用 bucket tokenizer + teacher 前向，统计 schedule token 上的差异：
+  - mean|Δlogits| ≈ 7.5e-02 ~ 7.9e-02
+  - KL ≈ 2.5e-03
+- 结论：teacher 对 arch 有明显敏感度，swap‑KD 信号不是 0。当前训练不收敛更可能来自 loss/路径/权重设置，而非 emb 本身无效。

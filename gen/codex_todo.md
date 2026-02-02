@@ -1,39 +1,54 @@
-任务 1：让 HF generate 的每一步都吃到你想要的 position_ids（核心修复）
-
-给 codex 的指令可以这么写（重点是 patch prepare_inputs_for_generation，每步塞 position_ids）：
-
-在 KV 模式调用 model.generate() 之前，monkey-patch：
-
-用 attention_mask 计算 position_ids
-
-计算 position 时强制忽略 prefix_len（即使 prefix_mask=1 也要忽略它对 position 的贡献）
-
-每一步只取当前输入长度那一段：position_ids[:, -input_ids.shape[1]:]
-
-伪代码要点（让 codex照这个写进 gen_state_debug_kv.py）：
-
-orig_prepare = model.prepare_inputs_for_generation
-prefix_len = hw_past[0][0].shape[-2]  # or args.hw_kv_num_slots
-
-def patched_prepare(input_ids, past_key_values=None, attention_mask=None, **kwargs):
-    model_inputs = orig_prepare(
-        input_ids,
-        past_key_values=past_key_values,
-        attention_mask=attention_mask,
-        **kwargs
-    )
-    if attention_mask is not None:
-        pos_mask = attention_mask.long()
-        # ignore prefix slots for position counting
-        if prefix_len > 0 and pos_mask.shape[1] >= prefix_len:
-            pos_mask[:, :prefix_len] = 0
-        position_ids = pos_mask.cumsum(-1) - 1
-        position_ids.masked_fill_(position_ids < 0, 0)
-        position_ids = position_ids[:, -input_ids.shape[1]:]
-        model_inputs["position_ids"] = position_ids
-    return model_inputs
-
-model.prepare_inputs_for_generation = patched_prepare
+现在我们把 embedding 分成“四段”，但段内混进了不同层级/不同维度的属性：比如在 identity/Ark 这段里同时放了“设备大类 one-hot（0~3）”和“has TensorCore 这类 GPU-specific 特征”，老师的核心意见是：这俩不是一个维度，放一起会显得“没道理/不顺眼”，而且 CPU 场景下某些位永远为 0，本质上也说明分段逻辑有问题。
 
 
-同时保留你现在的 forward 打点：你应该能看到 generate loop 里 不再是 position_ids=None。
+一句话： 分段是可以的，但每段必须对应清晰且一致的语义轴；否则后面做相似度/路由就会被“结构噪声”污染。
+
+2) 特征粒度过“指纹化”：过于具体到单卡，反而破坏训练目标（信息泄露）
+
+文档里明确提到：有些位“太具体到单个硬件”，在训练 aligner 时你本来想遮掉信息让它补全，但这些位把信息直接暴露，导致训练目标被短路。
+典型例子就是你提的 is AmperePlus：老师直说 “so what？设计不对”，因为它既不像“架构大类”，又不像“系统性可泛化特征”，还会带来强指纹。
+
+3) 类别体系不完整/不一致：有“一个架构位”，却没有“体系化架构表示”
+
+老师的质疑点是：你如果要放“架构代际”这种轴（Ampere/Volta/Hopper…），那就应该是一套一致的类别/编码体系；你现在只有一个 AmperePlus 会显得非常突兀——等价于“只给一个架构开了特殊通道”。
+
+
+这会直接带来两个后果：
+
+语义不统一（embedding 像是东拼西凑）
+
+
+泛化不自然：新硬件落点很难解释（你到底想表达“代际”，还是想表达“某种性能分界”？）
+
+4) 字段来源不清、可解释性不足：不知道“为什么要有这个位”
+
+你老师反复追问“这些东西你是哪来的？自己想的还是抄的？”尤其像 cloud 这种字段，你自己也说不清具体语义，老师认为：如果是你自己设计的，你必须讲得出含义；如果是引用/借鉴的，就要明确来源。
+
+同时老师给了一个非常明确的方向：embedding 的字段应该尽量来自“编译器/target 描述体系”（TVM / GCC / LLVM 的 target options），至少这样每个字段都有“工程上站得住”的出处，而不是拍脑袋。
+
+
+5) 数值归一化方案过度 heuristic：规则太多、太随意、难写进论文
+
+这一段你老师讲得非常直接：
+
+你用“收集 N 个硬件算均值方差”做归一化会依赖样本集合（选 4 个 vs 200 个结果就变了），这在方法学上不稳。
+
+如果某一维所有硬件都几乎不变/恒为 0，那不是靠 mask/置零来处理，而是设计时就该删掉这个维度。
+
+
+最大的问题是：你在归一化后又不断加“if / clip / log10 / log2 ……”的补丁，整体显得 ad-hoc，解释性很差。老师甚至点名：“你把这个写到 paper 里，你觉得能写吗？感觉很 tricky。”
+
+老师建议的“更像 AI 圈会做的”方式是：定一个统一目标范围（例如 0~1 或 -1~1），规则尽量少且统一（要么统一 z-score，要么每维按最大值/理论上界缩放），避免一堆特例。
+
+6) 目标函数未显式化：你想同时控制“强度”和“方向”，但 embedding 设计没对齐这个目标
+
+你自己也意识到冲突：embedding 想表达很多信息，但最后在路由打分（dot/cos）时出现尺度冲突，于是你才做大量“数值处理”去让向量更可分。
+
+老师的隐含观点是：“可分”不是靠不断调归一化规则堆出来的，而应该是 embedding 的语义结构 + 简洁归一化 + 路由训练共同实现。
+
+一句话总括你现在的 embedding 主要问题
+
+结构上：语义轴混杂、类别体系不完整；特征上：过度指纹化导致信息泄露；数值上：归一化太 heuristic 且样本依赖、难以解释与复现。
+
+
+需要一个更自洽的 embedding 分段模板（identity / GPU-specific / CPU-specific / environment）以及一套尽量少规则的归一化方案，保证后面路由的 cos/dot 不再被尺度问题绑架。

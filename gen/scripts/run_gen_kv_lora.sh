@@ -43,7 +43,7 @@ source "$PATHS_SH"
 
 ITER=$(printf "iter%02d" "$IDX")
 CUDA_ID="${EDGE_CUDA:-0}"
-EDGE_EMB_PATH="${EDGE_LORA_EMB:-$HW_EMB_V4}"
+EDGE_EMB_PATH="${EDGE_LORA_EMB:-${HW_EMB_V4U:-$HW_EMB_V4}}"
 KEEP_CNT="${EDGE_KEEP_CNT:-16}"
 
 run_gen() {
@@ -80,7 +80,7 @@ run_gen() {
     --use_bucket \
     --use_hw_kv --hw_kv_mode real \
     --hw_kv_aligner_path "$HW_KV_ALIGNER" \
-    --hardware_embedding_path "$HW_EMB_V4" \
+    --hardware_embedding_path "$EDGE_EMB_PATH" \
     --pos_compensate \
     | tee "$log_file"
 }

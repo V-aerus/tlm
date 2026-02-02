@@ -1,5 +1,5 @@
 # EdgeTLM 端到端重跑（新目录规划版）
-
+ export RUN_ROOT=/home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_runs/2026-01-04_bucketkv_lora_restart
 本文件基于 `gen/codex_todo.md` 的新规划，目标是把 **bucket+KV → LoRA 路由 → 测量 → SFT** 的全链路重新跑通，同时避免旧目录污染、便于复现与回溯。
 # 一键脚本速查（先看这里）
 
@@ -211,7 +211,8 @@ export BASE_CKPT=$GEN_DATA/Model/clm_gen_multi_v1_bucket_stage0/checkpoint-30000
 export TOKENIZER=$GEN_DATA/Model/gen_tokenizer_multi_v1_bucket
 
 export HW_KV_ALIGNER=$GEN_DATA/Model/hw_kv_aligner_train/hw_kv_aligner.pt
-export HW_EMB_V4=$TLM_ROOT/gen/Embedding/hardware_embeddings_v4.json
+export HW_EMB_V4=$TLM_ROOT/gen/Embedding/hardware_embeddings_v4_universe.json
+export HW_EMB_PREPROCESS=$TLM_ROOT/gen/Embedding/preprocess_v4u_zscore_v1.json
 export HW_EMB_V2=$TLM_ROOT/gen/Embedding/hardware_embeddings_v2.json
 
 mkdir -p $RUN_ROOT/_shared/targets
@@ -543,7 +544,7 @@ CUDA_VISIBLE_DEVICES=0 python $TLM_ROOT/gen/train_edge_expert.py \
 > bash /home/hehangshuai/workspace/tlm/gen/scripts/run_gen_kv_lora.sh 0  # 默认 4090
 > ```
 
-> 说明：路由 embedding 与 KV 注入统一使用 v4（默认 `--edge_embedding_path "$HW_EMB_V4"`）。
+> 说明：路由 embedding 与 KV 注入统一使用 v4_universe（默认 `--edge_embedding_path "$HW_EMB_V4"`）。
 
 ```bash
 mkdir -p $RUN_ROOT/4090/$ITER/gen $RUN_ROOT/4090/$ITER/logs
@@ -551,7 +552,7 @@ CUDA_VISIBLE_DEVICES=0 python $TLM_ROOT/gen/gen_state_kv_lora.py \
   --model_path "$BASE_CKPT" \
   --tokenizer_path "$TOKENIZER" \
   --edge_expert_dirs $RUN_ROOT/4090/$ITER/experts/v1_init \
-  --edge_embedding_path "$HW_EMB_V2" \
+  --edge_embedding_path "$HW_EMB_V4" \
   --sketch_path $RUN_ROOT/4090/$ITER/sketch/0_merge.json \
   --save_path $RUN_ROOT/4090/$ITER/gen/kv_lora.json \
   --target "$TARGET_4090" \
@@ -645,6 +646,32 @@ iter03: test_file_idx=3
 
 1) `utils.json` 的结构是按硬件顶层键（`4090`/`v100`）存 `measure_records`，不要写成顶层 `measure_records`。  
 2) `for_gen_train_sketch` 会按 `test_file_idx` 选 1/4 文件；只跑 idx=0 会导致 base 数据严重不完整。  
-3) KV 使用 `hardware_embeddings_v4.json`；LoRA 路由默认还是 v2（29 维），需显式传 `--edge_embedding_path "$HW_EMB_V2"`。  
-4) `prepare_edge_dataset.py --merge_mode lora_left` 已支持，`train_edge_expert.py` 会自动只对 paired 样本计算 gain loss。  
-5) 如果 `paired_count` 为 0，说明 base/lora 不是同一批 repr，需检查是否共用同一份 sketch 与测量记录。  
+3) KV/路由统一使用 `hardware_embeddings_v4_universe.json`；若旧专家仍是 v2（29 维），需显式传 `--edge_embedding_path "$HW_EMB_V2"`。  
+4) preprocess 版本固定为 `preprocess_v4u_zscore_v1.json`；新增硬件沿用同一版本，不要自动重算。  
+5) `prepare_edge_dataset.py --merge_mode lora_left` 已支持，`train_edge_expert.py` 会自动只对 paired 样本计算 gain loss。  
+6) 如果 `paired_count` 为 0，说明 base/lora 不是同一批 repr，需检查是否共用同一份 sketch 与测量记录。  
+
+---
+
+## 8. Router-only 校准（可选）
+
+当多个专家训练完成后，可做一次 router-only 校准（冻结 LoRA，仅更新 r/b/tau），用于多专家竞争对齐。
+
+### 8.1 构建混合数据集
+
+```bash
+python $TLM_ROOT/gen/scripts/build_router_calib_dataset.py \
+  --input 4090=$RUN_ROOT/4090/iterXX/sft/edge_sft_4090_vYY_lora_left.jsonl \
+  --input v100=$RUN_ROOT/v100/iterXX/sft/edge_sft_v100_vYY_lora_left.jsonl \
+  --output $RUN_ROOT/_shared/router_calib/edge_router_calib.jsonl
+```
+
+### 8.2 Router-only 校准
+
+```bash
+bash $TLM_ROOT/gen/scripts/run_router_calibration.sh \
+  $RUN_ROOT/_shared/router_calib/edge_router_calib.jsonl \
+  $RUN_ROOT/_shared/router_calib/experts_calib \
+  4090=$RUN_ROOT/4090/iterXX/experts/vYY_gain \
+  v100=$RUN_ROOT/v100/iterXX/experts/vYY_gain
+```

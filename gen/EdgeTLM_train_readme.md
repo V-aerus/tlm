@@ -1,5 +1,5 @@
   iter01（4090）基础流转 + LoRA 流转（全链路）
-
+ export RUN_ROOT=/home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_runs/2026-01-04_bucketkv_lora_restart
   source /home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_runs/2026-01-04_bucketkv_lora_restart/_shared/paths.sh
 
   # 1) 生成 sketch

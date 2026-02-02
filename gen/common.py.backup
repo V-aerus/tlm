@@ -118,3 +118,11 @@ def get_bert_files(target):
     files = list(set([it[2] for it in list(yield_hold_out_five_files(target, True))]))
     files.sort()
     return files
+
+
+    [BasePlusExperts] topk_selected_indices=[0, 1] names=['4090', 'v100']
+[EdgeTLM] topk_experts=['4090', 'v100'] weights=[0.7024903297424316, 0.03783733397722244] base_w=0.2597
+
+target 选为 v100：
+Worker 0:   0%|                                                                                                                                                                                 | 0/9 [00:00<?, ?it/s][BasePlusExperts] topk_selected_indices=[0, 1] names=['4090', 'v100']
+[EdgeTLM] topk_experts=['v100', '4090'] weights=[0.6156709790229797, 0.033884767442941666] base_w=0.3504

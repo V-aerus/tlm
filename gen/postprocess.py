@@ -19,6 +19,7 @@ class ScriptArguments:
     iter_max: int = field(default=None, metadata={"help": "Optional max iteration index to include (e.g., 1)."})
     iter_list: str = field(default=None, metadata={"help": "Optional comma list of iteration indices to include (e.g., 0,1,2)."})
     clean_output: bool = field(default=False, metadata={"help": "Delete existing output .json files before rebuilding."})
+    quiet: bool = field(default=False, metadata={"help": "Reduce output verbosity."})
 
 
 def _parse_iter_from_path(path: str):
@@ -50,7 +51,11 @@ def main():
         arg = arg.replace("--clean-output", "--clean_output")
         argv.append(arg)
     script_args: ScriptArguments = parser.parse_args_into_dataclasses(args=argv)[0]
-    print(script_args)
+    def log(msg: str):
+        if not script_args.quiet:
+            print(msg)
+
+    log(script_args)
     register_data_path(script_args.target)
     script_args.target = tvm.target.Target(script_args.target)
 
@@ -66,30 +71,30 @@ def main():
     #files = glob.glob(f'{MEASURE_RECORD_FOLDER}/*.json')
     files = []
     measure_records = get_measure_records(script_args.record_mode)
-    print(f"Measure records: {measure_records}")
+    log(f"Measure records: {measure_records}")
     if measure_records:
         files.extend(measure_records)
     else:
         files = glob.glob(f'{MEASURE_RECORD_FOLDER}/*.json')  # 回退到原有逻辑
     files = _filter_by_iter(files, iter_max=script_args.iter_max, iter_list=script_args.iter_list)
-    print(f"Files after measure_records: {files}")  # 添加调试输出
+    log(f"Files after measure_records: {files}")  # 添加调试输出
     #for file in files:
         #os.remove(file)
     #files = []
     from utils import get_finetuning_files, get_testtuning_files
     finetuning_files = get_finetuning_files()
     testtuning_files = get_testtuning_files()
-    print(f"Finetuning files: {finetuning_files}")  # 添加调试输出
-    print(f"Testtuning files: {testtuning_files}")  # 添加调试输出
+    log(f"Finetuning files: {finetuning_files}")  # 添加调试输出
+    log(f"Testtuning files: {testtuning_files}")  # 添加调试输出
     files.extend(get_finetuning_files())
     files.extend(get_testtuning_files())
     files = _filter_by_iter(files, iter_max=script_args.iter_max, iter_list=script_args.iter_list)
-    print(f"Found files: {files}")
+    log(f"Found files: {files}")
 
     record_dic = {}
     measured_record_set = set()
 
-    for file in tqdm.tqdm(files):
+    for file in tqdm.tqdm(files, disable=script_args.quiet):
         with open(file, 'r') as f:
             lines = f.read().strip().split('\n')
             for line in lines:
@@ -105,7 +110,7 @@ def main():
                     measured_record_set.add(i_str)
                     record_dic[workload_key].append(line)
 
-    for workload_key, lines in tqdm.tqdm(record_dic.items()):
+    for workload_key, lines in tqdm.tqdm(record_dic.items(), disable=script_args.quiet):
         task_key = (workload_key, str(script_args.target.kind))
         filename = f"{out_dir}/{clean_name(task_key)}.json"
         with open(filename, 'w') as f:
@@ -114,7 +119,7 @@ def main():
                 f.write('\n')
 
     from common import HARDWARE_PLATFORM
-    print(f"HARDWARE_PLATFORM: {HARDWARE_PLATFORM}")
+    log(f"HARDWARE_PLATFORM: {HARDWARE_PLATFORM}")
     assert HARDWARE_PLATFORM is not None
     measured_pkl_path = os.path.join(out_dir, f'measured_{HARDWARE_PLATFORM}.pkl')
     with open(measured_pkl_path, 'wb') as f:

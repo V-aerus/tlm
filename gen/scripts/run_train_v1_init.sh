@@ -21,6 +21,8 @@ fi
 # shellcheck disable=SC1090
 source "$PATHS_SH"
 
+EDGE_EMB_JSON="${EDGE_EMB_JSON:-${HW_EMB_V4U:-$HW_EMB_V4}}"
+
 if [[ -z "${RUN_ROOT:-}" ]]; then
   echo "RUN_ROOT is empty. Check your paths.sh or export RUN_ROOT explicitly."
   exit 1
@@ -86,7 +88,7 @@ python "$TLM_ROOT/gen/prepare_edge_dataset.py" \
   --merge_key repr \
   --dedupe_mode keep_all \
   --hardware-id "$HW" \
-  --embedding-json "$HW_EMB_V4" \
+  --embedding-json "$EDGE_EMB_JSON" \
   --allow-missing-lora
 
 echo "[STEP] train v1_init"

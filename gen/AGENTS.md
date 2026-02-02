@@ -47,7 +47,7 @@
 ## Coding Style & Naming Conventions
 - Python：4 空格缩进，`snake_case`；路由/门控类以 `Gated*` 命名，冻结基座以 `FrozenBase*` 命名。
 - 专家产物固定为 `adapter_model.* / adapter_config.json / router.json / metrics.json`。
-- `router.json.hardware_dim=24` 对应 `Embedding/hardware_embeddings_v4.json`；旧专家若为 `hardware_dim=29` 必须切换到 v2。
+- `router.json.hardware_dim=24` 对应 `Embedding/hardware_embeddings_v4_universe.json`；旧专家若为 `hardware_dim=29` 必须切换到 v2。
 
 ## Testing Guidelines
 - 本地变更优先跑 `python3 -m pytest -q`；需要真实硬件的测试可通过 `pytest -k` 过滤。

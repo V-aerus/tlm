@@ -10,6 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from multiprocessing import Process, Queue
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # KV injection invariants:
@@ -52,6 +53,7 @@ from modeling import (
     GatedLoRAExpert,
     PeftDeltaWrapper,
 )
+from modeling.hw_preprocess import apply_preprocess, preprocess_meta_equal, summarize_preprocess
 
 try:
     from peft import PeftModel
@@ -74,8 +76,8 @@ class ScriptArguments:
         metadata={"help": "Comma-separated EdgeTLM LoRA expert directories (enables expert routing)"},
     )
     edge_embedding_path: str = field(
-        default="Embedding/hardware_embeddings_v4.json",
-        metadata={"help": "Path to hardware_embeddings_v4.json for expert routing (must match router.json dim)"},
+        default="Embedding/hardware_embeddings_v4_universe.json",
+        metadata={"help": "Path to hardware_embeddings_v4_universe.json for expert routing (must match router.json dim)"},
     )
     edge_topk: int = field(default=1, metadata={"help": "Top-K experts to activate during inference"})
     edge_dump_meta: bool = field(
@@ -86,9 +88,13 @@ class ScriptArguments:
         default=False,
         metadata={"help": "Log top-k expert weights once per process (debug)."},
     )
+    allow_mixed_preprocess: bool = field(
+        default=False,
+        metadata={"help": "Allow mixing experts with different router preprocess meta."},
+    )
     hardware_embedding_path: str = field(
-        default="Embedding/hardware_embeddings_v4.json",
-        metadata={"help": "Path to hardware_embeddings_v4.json"},
+        default="Embedding/hardware_embeddings_v4_universe.json",
+        metadata={"help": "Path to hardware_embeddings_v4_universe.json"},
     )
     target_hardware: Optional[str] = field(
         default=None,
@@ -100,6 +106,10 @@ class ScriptArguments:
     use_bucket: bool = field(default=False, metadata={"help": "Use bucket tokens when forming text prompts"})
     use_hw_kv: bool = field(default=False, metadata={"help": "Enable HwKVAligner KV injection"})
     hw_kv_aligner_path: Optional[str] = field(default=None, metadata={"help": "Optional HwKVAligner checkpoint path"})
+    hw_kv_preprocess_json: str = field(
+        default="",
+        metadata={"help": "Optional preprocess JSON for HwKVAligner input (overrides ckpt meta)"},
+    )
     hw_kv_num_slots: int = field(default=4, metadata={"help": "Number of KV prefix slots (default 4)"})
     hw_kv_mode: Optional[str] = field(
         default=None,
@@ -191,6 +201,24 @@ def load_hardware_embeddings(path: str) -> Dict[str, List[float]]:
     with open(path, "r", encoding="utf-8") as f:
         entries = json.load(f)
     return {entry["hardware_name"]: entry["vector"] for entry in entries}
+
+
+def load_preprocess_params(path: Optional[str]) -> Optional[Dict]:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        params = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(params, dict):
+        return None
+    if "mean" in params and "std" in params and "mask" in params:
+        params.setdefault("source", str(p))
+        return params
+    return None
 
 
 def resolve_hw_embedding(hw_id: str, embeddings: Dict[str, List[float]]) -> Tuple[Optional[str], Optional[List[float]]]:
@@ -306,6 +334,7 @@ def prepare_hw_kv_context(
     hw_kv_aligner_path: Optional[str] = None,
     hw_kv_mode: Optional[str] = None,
     hw_kv_num_slots: int = 4,
+    hw_kv_preprocess_json: Optional[str] = None,
 ):
     if not use_hw_kv:
         return None
@@ -356,6 +385,9 @@ def prepare_hw_kv_context(
         backward_depth=min(4, n_layer),
         linker_temperature=1.0,
     )
+    preprocess_params = load_preprocess_params(hw_kv_preprocess_json)
+    preprocess_source = "args" if preprocess_params else ""
+
     if hw_kv_aligner_path:
         try:
             kv_state = torch.load(hw_kv_aligner_path, map_location=device)
@@ -363,9 +395,30 @@ def prepare_hw_kv_context(
             kv_aligner.load_state_dict(state, strict=False)
             print(f"Loaded HwKVAligner checkpoint from {hw_kv_aligner_path}")
             log_debug(f"[INFO] Loaded HwKVAligner checkpoint from {hw_kv_aligner_path}")
+            if preprocess_params is None:
+                ckpt_pre = kv_state.get("meta", {}).get("preprocess")
+                if ckpt_pre:
+                    preprocess_params = ckpt_pre
+                    preprocess_source = "ckpt"
         except Exception as e:
             print(f"[WARN] Failed to load HwKVAligner checkpoint: {e}")
             log_debug(f"[WARN] Failed to load HwKVAligner checkpoint: {e}")
+
+    if preprocess_params is None:
+        default_pre = Path("gen/Embedding/preprocess_v4u_zscore_v1.json")
+        preprocess_params = load_preprocess_params(str(default_pre))
+        if preprocess_params:
+            preprocess_source = "default"
+
+    if preprocess_params:
+        msg = f"[HW-KV] preprocess={summarize_preprocess(preprocess_params)} source={preprocess_source}"
+        print(msg)
+        log_debug(msg)
+        hw_vec_t = apply_preprocess(hw_vec_t, preprocess_params)
+    else:
+        msg = "[WARN] HwKVAligner preprocess not found; using raw hw_emb (may be inconsistent)."
+        print(msg)
+        log_debug(msg)
     kv_aligner.to(device)
     kv_aligner.eval()
     return {"mode": "real", "kv_aligner": kv_aligner, "hw_vec": hw_vec_t}
@@ -407,6 +460,7 @@ def load_model_for_inference(args: ScriptArguments):
         hw_emb_tensor = torch.tensor(hw_vector, dtype=torch.float32, device=device)
 
         registry = ExpertRegistry()
+        preprocess_metas: Dict[str, Optional[Dict]] = {}
         for dir_path in expert_dirs:
             resolved_dir = os.path.abspath(dir_path)
             router_path = os.path.join(resolved_dir, "router.json")
@@ -424,23 +478,49 @@ def load_model_for_inference(args: ScriptArguments):
 
             with open(router_path, "r", encoding="utf-8") as rf:
                 router_state = json.load(rf)
+            preprocess_params = router_state.get("meta", {}).get("preprocess")
             r_vector = torch.tensor(router_state["r"], dtype=torch.float32, device=device)
+            s_value = router_state.get("s")
+            if s_value is None:
+                s_value = float(torch.linalg.norm(r_vector).item())
             if r_vector.numel() != hw_emb_tensor.numel():
                 raise ValueError(
                     "Router dim mismatch: "
                     f"router={r_vector.numel()} vs hw_emb={hw_emb_tensor.numel()} for {resolved_dir}. "
                     "Please pass a matching --edge_embedding_path (e.g., v2) or retrain experts."
                 )
-            expert = GatedLoRAExpert(delta_wrapper, r_dim=r_vector.numel(), init_router=r_vector, reset_lora=False)
+            expert = GatedLoRAExpert(
+                delta_wrapper,
+                r_dim=r_vector.numel(),
+                init_router=r_vector,
+                init_scale=s_value,
+                reset_lora=False,
+            )
             beta_value = float(router_state.get("beta", float(expert.beta.detach().cpu())))
             tau_value = float(router_state.get("tau", float(expert.tau.detach().cpu())))
             with torch.no_grad():
                 expert.beta.fill_(beta_value)
                 expert.tau.fill_(tau_value)
+            expert.set_hw_preprocess(preprocess_params)
+            router_meta = router_state.get("meta", {})
+            score_mode = router_meta.get("score_mode")
+            two_stage = router_meta.get("two_stage")
+            comp_tau = router_meta.get("competition_tau")
+            if score_mode:
+                setattr(expert, "router_score_mode", score_mode)
+            if two_stage is not None:
+                setattr(expert, "router_two_stage", bool(two_stage))
+            if comp_tau is not None:
+                setattr(expert, "router_competition_tau", float(comp_tau))
             expert.to(device)
 
             expert_name = os.path.basename(resolved_dir.rstrip("/"))
             registry.register(expert_name, expert)
+            preprocess_metas[expert_name] = preprocess_params
+            if args.edge_debug_topk or os.environ.get("EDGE_EXPERT_DEBUG_TOPK") == "1":
+                msg = f"[ROUTER-PRE] {expert_name} {summarize_preprocess(preprocess_params)}"
+                print(msg)
+                log_debug(msg)
 
             if args.debug_hw_similarity:
                 meta_ids = router_state.get("meta", {}).get("hardware_ids", [])
@@ -452,6 +532,25 @@ def load_model_for_inference(args: ScriptArguments):
                     msg = f"[HW-SIM] target={hw_id} vs {meta_id}: cos={sim:.4f}"
                     print(msg)
                     log_debug(msg)
+
+        if len(preprocess_metas) > 1:
+            metas = list(preprocess_metas.values())
+            ref = metas[0]
+            mismatch = False
+            for meta in metas[1:]:
+                if not preprocess_meta_equal(ref, meta):
+                    mismatch = True
+                    break
+            if mismatch:
+                names = ", ".join(f"{k}={summarize_preprocess(v)}" for k, v in preprocess_metas.items())
+                msg = f"[WARN] Mixed router preprocess detected: {names}"
+                print(msg)
+                log_debug(msg)
+                if not args.allow_mixed_preprocess:
+                    raise ValueError(
+                        "Mixed router preprocess across experts. "
+                        "Use --allow-mixed-preprocess to override, or retrain routers."
+                    )
 
         system = BasePlusExperts(frozen_base, registry)
         topk = max(1, args.edge_topk)
@@ -1310,6 +1409,7 @@ def worker(
                 hw_kv_aligner_path=hw_kv_cfg.get("hw_kv_aligner_path"),
                 hw_kv_mode=hw_kv_cfg.get("hw_kv_mode"),
                 hw_kv_num_slots=hw_kv_cfg.get("hw_kv_num_slots", 4),
+                hw_kv_preprocess_json=hw_kv_cfg.get("hw_kv_preprocess_json"),
             )
 
         builder = auto_scheduler.measure.LocalBuilder(timeout=30)
@@ -1550,6 +1650,7 @@ def main():
             "hw_kv_aligner_path": script_args.hw_kv_aligner_path,
             "hw_kv_mode": mode or "real",
             "hw_kv_num_slots": script_args.hw_kv_num_slots,
+            "hw_kv_preprocess_json": script_args.hw_kv_preprocess_json,
             "hw_vec_stats": stats,
         }
 

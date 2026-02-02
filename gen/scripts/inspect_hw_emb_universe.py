@@ -18,6 +18,9 @@ from gen.Embedding.hardware_embedding_generator_v4 import (  # noqa: E402
     EmbeddingV4Generator,
     _default_tvm_config,
 )
+import torch
+
+from gen.modeling.hw_preprocess import build_preprocess_params, apply_preprocess, summarize_preprocess  # noqa: E402
 
 
 UNIVERSE_ADDITIONS = [
@@ -43,6 +46,7 @@ GPU_COS_PAIRS = [
     ("nvidia/rtx-4090", "nvidia/nvidia-v100"),
     ("nvidia/rtx-4090", "nvidia/geforce-gtx-1060"),
     ("nvidia/nvidia-v100", "nvidia/geforce-gtx-950"),
+    ("nvidia/jetson-orin", "nvidia/jetson-agx-xavier"),
 ]
 
 
@@ -74,6 +78,16 @@ def _stats(vectors: List[List[float]]) -> Tuple[List[float], List[float], List[f
     return means, stds, mins, maxs
 
 
+def _resolve_path(path_str: str) -> Path:
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    candidate = ROOT / path
+    if candidate.exists():
+        return candidate
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -92,9 +106,19 @@ def main() -> None:
         default=1e-6,
         help="Std threshold to flag near-constant dims.",
     )
+    parser.add_argument(
+        "--show-preprocess",
+        action="store_true",
+        help="Also print cosine similarities after routing preprocess.",
+    )
+    parser.add_argument("--preprocess-type", default="zscore_mask", choices=["identity", "zscore_mask"])
+    parser.add_argument("--preprocess-std-floor", type=float, default=1e-3)
+    parser.add_argument("--preprocess-clip", type=float, default=5.0)
+    parser.add_argument("--preprocess-mask-mode", default="zero", choices=["zero", "keep_raw"])
+    parser.add_argument("--preprocess-fallback-dim", type=int, default=4)
     args = parser.parse_args()
 
-    v4_path = Path(args.v4_json)
+    v4_path = _resolve_path(args.v4_json)
     base_entries = json.loads(v4_path.read_text(encoding="utf-8"))
     base_map: Dict[str, List[float]] = {e["hardware_name"]: e["vector"] for e in base_entries}
     base_only = dict(base_map)
@@ -110,7 +134,8 @@ def main() -> None:
         added.append(name)
 
     universe_entries = [{"hardware_name": name, "vector": base_map[name]} for name in sorted(base_map.keys())]
-    Path(args.output_json).write_text(json.dumps(universe_entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    output_path = _resolve_path(args.output_json)
+    output_path.write_text(json.dumps(universe_entries, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"[INFO] v4 entries: {len(base_entries)}")
     print(f"[INFO] universe entries: {len(universe_entries)} (added {len(added)})")
@@ -150,6 +175,28 @@ def main() -> None:
             print(f"  - {a_name} vs {b_name}: MISSING")
             continue
         print(f"  - {a_name} vs {b_name}: cos={_cos(a_vec, b_vec):.6f}")
+
+    if args.show_preprocess:
+        params = build_preprocess_params(
+            vectors,
+            preprocess_type=args.preprocess_type,
+            std_floor=args.preprocess_std_floor,
+            clip=args.preprocess_clip,
+            mask_mode=args.preprocess_mask_mode,
+            fallback_min_dim=args.preprocess_fallback_dim,
+            source=str(output_path),
+        )
+        print("\n[PREPROCESS] ", summarize_preprocess(params))
+        print("\n[GPU COSINE] after preprocess")
+        for a_name, b_name in GPU_COS_PAIRS:
+            a_vec = base_map.get(a_name)
+            b_vec = base_map.get(b_name)
+            if a_vec is None or b_vec is None:
+                print(f"  - {a_name} vs {b_name}: MISSING")
+                continue
+            a_t = apply_preprocess(torch.tensor(a_vec), params).tolist()
+            b_t = apply_preprocess(torch.tensor(b_vec), params).tolist()
+            print(f"  - {a_name} vs {b_name}: cos={_cos(a_t, b_t):.6f}")
 
 
 if __name__ == "__main__":

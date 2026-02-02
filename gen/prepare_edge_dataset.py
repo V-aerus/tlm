@@ -13,7 +13,7 @@ from datasets import DatasetDict
 from transformers import AutoTokenizer
 
 
-EMBEDDING_PATH_DEFAULT = Path("Embedding/hardware_embeddings_v4.json")
+EMBEDDING_PATH_DEFAULT = Path("Embedding/hardware_embeddings_v4_universe.json")
 KNOWN_DEFAULTS = {
     "v100": ["nvidia/nvidia-v100"],
     "4090": ["nvidia/rtx-4090", "nvidia/nvidia-a40"],  # sm_86 (v4 uses rtx-4090)
@@ -49,7 +49,7 @@ def main() -> None:
     parser.add_argument(
         "--embedding-json",
         default=str(EMBEDDING_PATH_DEFAULT),
-        help="Hardware embedding json file (default: Embedding/hardware_embeddings_v4.json).",
+        help="Hardware embedding json file (default: Embedding/hardware_embeddings_v4_universe.json).",
     )
     parser.add_argument("--allow-missing-lora", action="store_true", help="If set, lat_lora_star will be None; otherwise defaults to lat_base_star.")
     parser.add_argument("--base-jsonl", default=None, help="Optional JSONL containing base measurements (produced by prepare_edge_dataset.py).")
