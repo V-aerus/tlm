@@ -4,6 +4,12 @@ hardware_embedding_generator_v4.py
 Generate physics-aware hardware embeddings (24-dim) with explicit bucketed identity,
 TVM constraint logs, and physical performance specs. Designed as a drop-in replacement
 for previous v2/v3 generators: call `generate(name: str, tvm_config: dict) -> List[float]`.
+
+A组：硬件类型识别
+B组：编译约束
+C组：性能规格
+D组：运行环境
+
 """
 import math
 from dataclasses import dataclass
