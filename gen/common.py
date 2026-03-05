@@ -9,6 +9,26 @@ TO_MEASURE_PROGRAM_FOLDER = None
 MEASURE_RECORD_FOLDER = None
 HARDWARE_PLATFORM = None
 
+
+def _resolve_data_root():
+    """Resolve dataset root in a portable way.
+
+    Priority:
+      1) DATA_ROOT env (expected: .../tlm_dataset/gen)
+      2) TLM_ROOT env + /tlm_dataset/gen
+      3) infer from current file path (repo_root/tlm_dataset/gen)
+    """
+    data_root = os.environ.get("DATA_ROOT", "").strip()
+    if data_root:
+        return data_root
+
+    tlm_root = os.environ.get("TLM_ROOT", "").strip()
+    if tlm_root:
+        return os.path.join(tlm_root, "tlm_dataset", "gen")
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    return os.path.join(repo_root, "tlm_dataset", "gen")
+
 def clean_name(x):
     x = str(x)
     x = x.replace(" ", "")
@@ -18,7 +38,7 @@ def clean_name(x):
 
 def register_data_path(target_str):
     assert(isinstance(target_str, str))
-    model_list = ['i7', 'v100', 'a100', '2080', '4090', '3090', 'xavier', 'xeon', 'multi', 'None']
+    model_list = ['i7', 'v100', 'a100', '2080', '4090', '3090', 'xavier', 'orin', 'ryzen5800h', 'xeon', 'multi', 'None']
     alias_map = {
         # 3090 直接复用 4090 的数据目录/网络信息
         '3090': '4090',
@@ -40,8 +60,12 @@ def register_data_path(target_str):
             model = "v100"
         elif "arch=sm_75" in ts:
             model = "2080"
+        elif "arch=sm_87" in ts or "orin" in ts:
+            model = "orin"
         elif "arch=sm_72" in ts or "carmel" in ts:
             model = "xavier"
+        elif "mcpu=znver3" in ts or "mcpu=znver2" in ts or "mcpu=znver1" in ts or "5800h" in ts or "ryzen" in ts:
+            model = "ryzen5800h"
         elif "skylake-avx512" in ts or "mcpu=skylake" in ts:
             model = "xeon"
     # 将别名映射到实际目录
@@ -50,9 +74,10 @@ def register_data_path(target_str):
 
     print(f'register data path: {model}')
     global NETWORK_INFO_FOLDER, TO_MEASURE_PROGRAM_FOLDER, MEASURE_RECORD_FOLDER, HARDWARE_PLATFORM
-    NETWORK_INFO_FOLDER = f"/home/hehangshuai/workspace/tlm/tlm_dataset/gen/dataset/network_info/{model}"
-    TO_MEASURE_PROGRAM_FOLDER = f"/home/hehangshuai/workspace/tlm/tlm_dataset/gen/dataset/to_measure_programs/{model}"
-    MEASURE_RECORD_FOLDER = f"/home/hehangshuai/workspace/tlm/tlm_dataset/gen/dataset/measure_records/{model}"
+    data_root = _resolve_data_root()
+    NETWORK_INFO_FOLDER = f"{data_root}/dataset/network_info/{model}"
+    TO_MEASURE_PROGRAM_FOLDER = f"{data_root}/dataset/to_measure_programs/{model}"
+    MEASURE_RECORD_FOLDER = f"{data_root}/dataset/measure_records/{model}"
     HARDWARE_PLATFORM = model
 
 
@@ -143,11 +168,20 @@ def get_bert_files(target):
 
 
 def get_ansor_eval_files(target):
-    """Return measure record filenames for Ansor baseline networks (bert_base/resnet_50/mobilenet_v2)."""
+    """Return measure record filenames for Ansor baseline networks.
+
+    Default set: bert_base / resnet_50 / mobilenet_v2 / inception_v3(1x3x299x299).
+    """
     selected = []
     for workload, _, record_file, _ in yield_hold_out_five_files(target, only_bert=False):
         if workload in ("bert_base", "resnet_50", "mobilenet_v2"):
             selected.append(record_file)
+    # Inception v3 is not part of hold_out_task_files(), so append from network_info directly.
+    inception_task_file = get_task_info_filename(("inception_v3", [1, 3, 299, 299]), target)
+    if os.path.exists(inception_task_file):
+        tasks_part, task_weights = pickle.load(open(inception_task_file, "rb"))
+        for task, _weight in zip(tasks_part, task_weights):
+            selected.append(get_measure_record_filename(task, target))
     selected = list(set(selected))
     selected.sort()
     return selected
