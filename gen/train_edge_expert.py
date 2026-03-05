@@ -134,7 +134,18 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--init-expert-dir", default=None, help="Optional expert dir to resume (adapter + router).")
-    parser.add_argument("--router-preprocess", default="identity", choices=["identity", "zscore_mask"])
+    parser.add_argument(
+        "--router-preprocess",
+        default="identity",
+        choices=[
+            "identity",
+            "zscore_mask",
+            "v5_logmask",
+            "v5_router_proc_v1",
+            "v5_transform",
+            "v5_transform_zscore_valid",
+        ],
+    )
     parser.add_argument(
         "--router-preprocess-embeddings",
         default="",
@@ -396,7 +407,9 @@ def main() -> None:
 
             task_loss = compute_task_loss(logits, labels, ignore_index=tokenizer.pad_token_id)
 
-            gates = expert.gating_weight(hw_emb)
+            # Keep gate statistics/losses on the same preprocessed feature space as forward_single.
+            z_for_gate = expert.gate_inputs(hw_emb=hw_emb)
+            gates = expert.gating_weight(z_for_gate)
             g_mean = gates.mean()
             paired_mask = (~torch.isnan(lat_base)) & (~torch.isnan(lat_lora))
             paired_count = int(paired_mask.sum().item())

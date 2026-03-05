@@ -54,6 +54,14 @@ def main():
     def log(msg: str):
         if not script_args.quiet:
             print(msg)
+    def _fmt_paths(paths, max_show: int = 6) -> str:
+        if paths is None:
+            return "None"
+        n = len(paths)
+        if n <= max_show:
+            return str(paths)
+        head = paths[:max_show]
+        return f"{head} ... (+{n - max_show} more)"
 
     log(script_args)
     register_data_path(script_args.target)
@@ -68,28 +76,38 @@ def main():
         for file in old_files:
             os.remove(file)
 
-    #files = glob.glob(f'{MEASURE_RECORD_FOLDER}/*.json')
+    # files = glob.glob(f'{MEASURE_RECORD_FOLDER}/*.json')
     files = []
     measure_records = get_measure_records(script_args.record_mode)
-    log(f"Measure records: {measure_records}")
+    log(f"Measure records ({len(measure_records)}): {_fmt_paths(measure_records)}")
     if measure_records:
         files.extend(measure_records)
     else:
-        files = glob.glob(f'{MEASURE_RECORD_FOLDER}/*.json')  # 回退到原有逻辑
+        # IMPORTANT:
+        # For mode-specific postprocess (base/kv_lora), we must NOT fallback to MEASURE_RECORD_FOLDER,
+        # otherwise we may accidentally populate base/kv_lora dirs with unrelated (e.g. all-mode) records.
+        if script_args.record_mode == "all":
+            files = glob.glob(f"{MEASURE_RECORD_FOLDER}/*.json")  # legacy fallback
+        else:
+            log(
+                f"[WARN] No measure_records found for record_mode='{script_args.record_mode}'. "
+                "Skip without fallback (consider --clean-output to avoid stale files)."
+            )
+            files = []
     files = _filter_by_iter(files, iter_max=script_args.iter_max, iter_list=script_args.iter_list)
-    log(f"Files after measure_records: {files}")  # 添加调试输出
+    log(f"Files after measure_records: {len(files)} files")  # avoid dumping huge path lists
     #for file in files:
         #os.remove(file)
     #files = []
     from utils import get_finetuning_files, get_testtuning_files
     finetuning_files = get_finetuning_files()
     testtuning_files = get_testtuning_files()
-    log(f"Finetuning files: {finetuning_files}")  # 添加调试输出
-    log(f"Testtuning files: {testtuning_files}")  # 添加调试输出
+    log(f"Finetuning files: {len(finetuning_files)}")
+    log(f"Testtuning files: {len(testtuning_files)}")
     files.extend(get_finetuning_files())
     files.extend(get_testtuning_files())
     files = _filter_by_iter(files, iter_max=script_args.iter_max, iter_list=script_args.iter_list)
-    log(f"Found files: {files}")
+    log(f"Found files: {len(files)} files")
 
     record_dic = {}
     measured_record_set = set()

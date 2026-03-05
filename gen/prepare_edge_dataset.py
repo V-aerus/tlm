@@ -70,7 +70,7 @@ def main() -> None:
     parser.add_argument(
         "--dedupe_mode",
         choices=("min", "keep_all"),
-        default="keep_all",
+        default="min",
         help="JSONL merge output mode: 'min' keeps one record per key (best latency). "
              "'keep_all' outputs all records but uses per-key min latency for *_star fields.",
     )

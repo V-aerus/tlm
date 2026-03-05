@@ -572,7 +572,7 @@ def load_model_for_inference(args: ScriptArguments) -> tuple:
                 router_state = json.load(rf)
 
             r_vector = torch.tensor(router_state["r"], dtype=torch.float32, device=device)
-            expert = GatedLoRAExpert(delta_wrapper, r_dim=r_vector.numel(), init_router=r_vector)
+            expert = GatedLoRAExpert(delta_wrapper, r_dim=r_vector.numel(), init_router=r_vector, reset_lora=False)
             beta_value = float(router_state.get("beta", float(expert.beta.detach().cpu())))
             tau_value = float(router_state.get("tau", float(expert.tau.detach().cpu())))
             with torch.no_grad():
@@ -970,7 +970,17 @@ def worker(err_queue, save_path_i, sketch_path, gen_kwargs, model_path, adapter_
                         debug_ctx["last_prompts"] = None
 
                     generations = gen_func(task, states, inputs[0], tokenizer, model, device, gen_kwargs, hw_injection_ctx=hw_injection_ctx)
-                    debug_ctx["last_generations"] = generations
+                    # 将生成结果转为可读字符串，便于日志调试
+                    decoded_generations = []
+                    try:
+                        for g in generations:
+                            if isinstance(g, list):
+                                decoded_generations.append(tokenizer.convert_tokens_to_string(g))
+                            else:
+                                decoded_generations.append(str(g))
+                    except Exception:
+                        decoded_generations = generations
+                    debug_ctx["last_generations"] = decoded_generations
                     return generations
 
                 policy = auto_scheduler.SketchPolicy(inputs[0].task)

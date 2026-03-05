@@ -61,7 +61,16 @@ fi
 # shellcheck disable=SC1090
 source "$PATHS_SH"
 
-EDGE_EMB_PATH="${EDGE_EMB_PATH:-${HW_EMB_V4U:-$HW_EMB_V4}}"
+if [[ -z "${EDGE_EMB_PATH:-}" ]]; then
+  if [[ -n "${HW_EMB_V5:-}" && -f "${HW_EMB_V5}" ]]; then
+    EDGE_EMB_PATH="$HW_EMB_V5"
+  elif [[ -f "$TLM_ROOT/gen/Embedding/hardware_embeddings_v5_draft.json" ]]; then
+    EDGE_EMB_PATH="$TLM_ROOT/gen/Embedding/hardware_embeddings_v5_draft.json"
+  else
+    EDGE_EMB_PATH="${HW_EMB_V4U:-$HW_EMB_V4}"
+  fi
+fi
+EDGE_HW_KV_ALIGNER="${EDGE_HW_KV_ALIGNER:-$HW_KV_ALIGNER}"
 
 EXPERT_4090="${EDGE_EXPERT_4090:-}"
 EXPERT_V100="${EDGE_EXPERT_V100:-}"
@@ -174,7 +183,7 @@ run_kv_lora() {
       --keep_cnt "$KEEP_CNT" \
       --use_bucket \
       --use_hw_kv --hw_kv_mode real \
-      --hw_kv_aligner_path "$HW_KV_ALIGNER" \
+      --hw_kv_aligner_path "$EDGE_HW_KV_ALIGNER" \
       --pos_compensate \
       | tee "$LOG_DIR/gen_${tag}.log"
     return 0
@@ -194,7 +203,7 @@ run_kv_lora() {
     --keep_cnt "$KEEP_CNT" \
     --use_bucket \
     --use_hw_kv --hw_kv_mode real \
-    --hw_kv_aligner_path "$HW_KV_ALIGNER" \
+    --hw_kv_aligner_path "$EDGE_HW_KV_ALIGNER" \
     --pos_compensate \
     | tee "$LOG_DIR/gen_${tag}.log"
 }

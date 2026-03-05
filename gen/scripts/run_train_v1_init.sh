@@ -2,13 +2,15 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: bash gen/scripts/run_train_v1_init.sh <hw>"
+  echo "Usage: bash gen/scripts/run_train_v1_init.sh <hw> [tag]"
   echo "  hw: v100|4090 (required)"
+  echo "  tag: expert output tag (optional, default: EDGE_EXPERT_TAG or v1_init)"
   echo "  env: EDGE_ITER_MAX=0 (default 0)"
   exit 1
 fi
 
 HW="$1"
+TAG="${2:-${EDGE_EXPERT_TAG:-v1_init}}"
 ITER_MAX="${EDGE_ITER_MAX:-0}"
 
 PATHS_SH="${EDGE_PATHS_SH:-/home/hehangshuai/workspace/tlm/tlm_dataset/gen/gen_data/edge_runs/2026-01-04_bucketkv_lora_restart/_shared/paths.sh}"
@@ -21,7 +23,15 @@ fi
 # shellcheck disable=SC1090
 source "$PATHS_SH"
 
-EDGE_EMB_JSON="${EDGE_EMB_JSON:-${HW_EMB_V4U:-$HW_EMB_V4}}"
+if [[ -z "${EDGE_EMB_JSON:-}" ]]; then
+  if [[ -n "${HW_EMB_V5:-}" && -f "${HW_EMB_V5}" ]]; then
+    EDGE_EMB_JSON="$HW_EMB_V5"
+  elif [[ -f "$TLM_ROOT/gen/Embedding/hardware_embeddings_v5_draft.json" ]]; then
+    EDGE_EMB_JSON="$TLM_ROOT/gen/Embedding/hardware_embeddings_v5_draft.json"
+  else
+    EDGE_EMB_JSON="${HW_EMB_V4U:-$HW_EMB_V4}"
+  fi
+fi
 
 if [[ -z "${RUN_ROOT:-}" ]]; then
   echo "RUN_ROOT is empty. Check your paths.sh or export RUN_ROOT explicitly."
@@ -86,7 +96,7 @@ python "$TLM_ROOT/gen/prepare_edge_dataset.py" \
   --output-jsonl "$EDGE_SFT_BASE" \
   --merge_mode base_left \
   --merge_key repr \
-  --dedupe_mode keep_all \
+  --dedupe_mode "${EDGE_DEDUPE_MODE:-min}" \
   --hardware-id "$HW" \
   --embedding-json "$EDGE_EMB_JSON" \
   --allow-missing-lora
@@ -97,4 +107,5 @@ export EDGE_LORA_LAMBDA_GAIN=0
 export EDGE_LORA_WARMUP=0
 unset EDGE_INIT_EXPERT_DIR
 export EDGE_RESUME_PREV=0
-bash "$TLM_ROOT/gen/scripts/run_train_edge_expert.sh" 0 "$HW" v1_init
+echo "[CONFIG] init tag=$TAG"
+bash "$TLM_ROOT/gen/scripts/run_train_edge_expert.sh" 0 "$HW" "$TAG"

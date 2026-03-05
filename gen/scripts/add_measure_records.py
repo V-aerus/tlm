@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from typing import Optional, Tuple
+import fcntl
 
 
 def find_repo_root(start_dir: str, max_up: int = 6) -> Tuple[Optional[str], Optional[str]]:
@@ -86,50 +87,58 @@ def main() -> None:
         print(f"Measured file not found: {measured_path}")
         sys.exit(1)
 
-    with open(utils_path, "r", encoding="utf-8") as f:
-        utils = json.load(f)
+    lock_path = f"{utils_path}.lock"
+    os.makedirs(os.path.dirname(os.path.abspath(utils_path)), exist_ok=True)
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 
-    hw_key = args.hardware
-    utils.setdefault(hw_key, {}).setdefault("measure_records", [])
-    if args.mode == "base":
-        utils.setdefault(hw_key, {}).setdefault("measure_records_base", [])
-        target_list = utils[hw_key]["measure_records_base"]
-        list_name = "measure_records_base"
-    else:
-        utils.setdefault(hw_key, {}).setdefault("measure_records_kv_lora", [])
-        target_list = utils[hw_key]["measure_records_kv_lora"]
-        list_name = "measure_records_kv_lora"
+        if os.path.exists(utils_path):
+            with open(utils_path, "r", encoding="utf-8") as f:
+                utils = json.load(f)
+        else:
+            utils = {}
 
-    before_count = len(target_list)
-    if measured_path in target_list:
-        print("Already present in utils.json:")
+        hw_key = args.hardware
+        utils.setdefault(hw_key, {}).setdefault("measure_records", [])
+        if args.mode == "base":
+            utils.setdefault(hw_key, {}).setdefault("measure_records_base", [])
+            target_list = utils[hw_key]["measure_records_base"]
+            list_name = "measure_records_base"
+        else:
+            utils.setdefault(hw_key, {}).setdefault("measure_records_kv_lora", [])
+            target_list = utils[hw_key]["measure_records_kv_lora"]
+            list_name = "measure_records_kv_lora"
+
+        before_count = len(target_list)
+        if measured_path in target_list:
+            print("Already present in utils.json:")
+            print(f"  utils_path: {utils_path}")
+            print(f"  hardware: {hw_key}")
+            print(f"  measured_path: {measured_path}")
+            print(f"  list: {list_name}")
+            print(f"  count: {before_count}")
+            return
+
+        if measured_path not in utils[hw_key]["measure_records"]:
+            utils[hw_key]["measure_records"].append(measured_path)
+        if measured_path not in target_list:
+            target_list.append(measured_path)
+        after_count = len(target_list)
+
+        print("Planned update:")
         print(f"  utils_path: {utils_path}")
         print(f"  hardware: {hw_key}")
         print(f"  measured_path: {measured_path}")
         print(f"  list: {list_name}")
-        print(f"  count: {before_count}")
-        return
+        print(f"  count: {before_count} -> {after_count}")
 
-    if measured_path not in utils[hw_key]["measure_records"]:
-        utils[hw_key]["measure_records"].append(measured_path)
-    if measured_path not in target_list:
-        target_list.append(measured_path)
-    after_count = len(target_list)
+        if args.dry_run:
+            print("Dry run: no changes written.")
+            return
 
-    print("Planned update:")
-    print(f"  utils_path: {utils_path}")
-    print(f"  hardware: {hw_key}")
-    print(f"  measured_path: {measured_path}")
-    print(f"  list: {list_name}")
-    print(f"  count: {before_count} -> {after_count}")
-
-    if args.dry_run:
-        print("Dry run: no changes written.")
-        return
-
-    with open(utils_path, "w", encoding="utf-8") as f:
-        json.dump(utils, f, indent=2)
-    print("Updated utils.json successfully.")
+        with open(utils_path, "w", encoding="utf-8") as f:
+            json.dump(utils, f, indent=2)
+        print("Updated utils.json successfully.")
 
 
 if __name__ == "__main__":

@@ -4,15 +4,15 @@ set -euo pipefail
 if [[ $# -lt 1 ]]; then
   echo "Usage: bash gen/scripts/run_train_edge_expert.sh <idx> [hw] [tag]"
   echo "  idx: non-negative integer (0,1,2,...)"
-  echo "  hw: 4090|v100 (optional, default: EDGE_HW or 4090)"
+  echo "  hw: hardware key in RUN_ROOT (e.g. 4090|v100|xavier|xeon; default: EDGE_HW or 4090)"
   echo "  tag: expert output tag (optional, default: EDGE_EXPERT_TAG or v1_init)"
   echo "  env: EDGE_INIT_EXPERT_DIR=/path/to/prev_expert (resume from previous LoRA)"
   echo "       EDGE_RESUME_PREV=0 (disable auto-resume from previous iter)"
   echo "       EDGE_PREV_EXPERT_TAG=v1_init (auto-resume tag when idx>0)"
   echo "       EDGE_LORA_GAIN_MARGIN=0.05 (override gain margin)"
-  echo "       EDGE_ROUTER_PREPROCESS=zscore_mask (enable routing preprocess)"
-  echo "       EDGE_ROUTER_PREPROCESS_EMB=/path/to/hardware_embeddings_v4_universe.json"
-  echo "       EDGE_ROUTER_PREPROCESS_JSON=/path/to/preprocess_v4u_zscore_v1.json"
+  echo "       EDGE_ROUTER_PREPROCESS=v5_transform_zscore_valid (enable routing preprocess)"
+  echo "       EDGE_ROUTER_PREPROCESS_EMB=/path/to/hardware_embeddings_v5_draft.json"
+  echo "       EDGE_ROUTER_PREPROCESS_JSON=/path/to/preprocess_v5_zscore_v1.json"
   echo "       EDGE_TRAIN_ROUTER_ONLY=1 (freeze LoRA, train router only)"
   exit 1
 fi
@@ -41,7 +41,7 @@ fi
 ITER=$(printf "iter%02d" "$IDX")
 HW="${2:-${EDGE_HW:-4090}}"
 TAG="${3:-${EDGE_EXPERT_TAG:-v1_init}}"
-CUDA_ID="${EDGE_CUDA:-0}"
+CUDA_ID="${EDGE_CUDA:-2}"
 
 DATASET="${EDGE_DATASET_JSONL:-$RUN_ROOT/${HW}/${ITER}/sft/edge_sft_${HW}.jsonl}"
 OUT_DIR="${EDGE_EXPERT_OUT_DIR:-$RUN_ROOT/${HW}/${ITER}/experts/${TAG}}"
@@ -76,9 +76,19 @@ ALPHA="${EDGE_LORA_ALPHA:-32}"
 DROPOUT="${EDGE_LORA_DROPOUT:-0.05}"
 MAXLEN="${EDGE_LORA_MAXLEN:-512}"
 GRAD_CLIP="${EDGE_LORA_GRAD_CLIP:-1.0}"
-ROUTER_PREPROCESS="${EDGE_ROUTER_PREPROCESS:-identity}"
+DEFAULT_ROUTER_PRE_JSON="$TLM_ROOT/gen/Embedding/preprocess_v5_zscore_v1.json"
+if [[ -n "${EDGE_ROUTER_PREPROCESS:-}" ]]; then
+  ROUTER_PREPROCESS="$EDGE_ROUTER_PREPROCESS"
+elif [[ -f "$DEFAULT_ROUTER_PRE_JSON" ]]; then
+  ROUTER_PREPROCESS="v5_transform_zscore_valid"
+else
+  ROUTER_PREPROCESS="identity"
+fi
 ROUTER_PREPROCESS_EMB="${EDGE_ROUTER_PREPROCESS_EMB:-}"
 ROUTER_PREPROCESS_JSON="${EDGE_ROUTER_PREPROCESS_JSON:-}"
+if [[ -z "$ROUTER_PREPROCESS_JSON" && "$ROUTER_PREPROCESS" != "identity" && -f "$DEFAULT_ROUTER_PRE_JSON" ]]; then
+  ROUTER_PREPROCESS_JSON="$DEFAULT_ROUTER_PRE_JSON"
+fi
 if [[ -n "$ROUTER_PREPROCESS_JSON" ]]; then
   ROUTER_PREPROCESS_EMB=""
 fi

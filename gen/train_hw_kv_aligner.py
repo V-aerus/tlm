@@ -7,6 +7,7 @@ Train HwKVAligner on bucket化的张量句子：
 import argparse
 import json
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -115,6 +116,7 @@ def collate_fn(batch, tokenizer):
         "attention_mask_s": enc_s["attention_mask"],
         "input_ids_t": enc_t["input_ids"],
         "attention_mask_t": enc_t["attention_mask"],
+        "texts_full": texts_full,
         "hw_ids": hw_ids,
     }
 
@@ -180,6 +182,135 @@ def build_schedule_weights(
     return weights
 
 
+ARCH_BY_HW_NAME = {
+    "nvidia/nvidia-v100": "sm_70",
+    "nvidia/rtx-4090": "sm_86",
+    "nvidia/geforce-rtx-3090": "sm_86",
+    "nvidia/nvidia-a40": "sm_86",
+    "nvidia/jetson-agx-xavier": "sm_72",
+    "nvidia/jetson-orin": "sm_87",
+}
+
+
+def infer_arch_from_text_or_hw(text_full: str, hw_name: str) -> Optional[str]:
+    m = re.search(r"-arch=(sm_\d+)", text_full or "")
+    if m:
+        return m.group(1)
+    return ARCH_BY_HW_NAME.get((hw_name or "").lower())
+
+
+def replace_arch_token(text: str, target_arch: Optional[str]) -> Tuple[str, bool]:
+    if not target_arch:
+        return text, False
+    toks = text.split()
+    for i, tok in enumerate(toks):
+        if tok.startswith("-arch=sm_"):
+            new_tok = f"-arch={target_arch}"
+            if tok == new_tok:
+                return text, False
+            toks[i] = new_tok
+            return " ".join(toks), True
+    # Fallback: rare formatting variants
+    out = re.sub(r"(^|\s)-arch=sm_\d+", rf"\1-arch={target_arch}", text, count=1)
+    return out, out != text
+
+
+def compute_kd_on_schedule(
+    shift_logits_s: torch.Tensor,
+    shift_logits_t: torch.Tensor,
+    shift_labels_s: torch.Tensor,
+    shift_labels_t: torch.Tensor,
+    temperature: float,
+    schedule_prefix_len: int,
+    schedule_decay: float,
+    kd_mismatch_threshold: float,
+) -> Tuple[torch.Tensor, int, int, float]:
+    kd_terms = []
+    kd_mismatch_count = 0
+    T = temperature
+    B = shift_logits_s.size(0)
+    for b in range(B):
+        idx_s = (shift_labels_s[b] != -100).nonzero(as_tuple=True)[0]
+        idx_t = (shift_labels_t[b] != -100).nonzero(as_tuple=True)[0]
+        L = min(idx_s.numel(), idx_t.numel())
+        if L == 0:
+            continue
+        if schedule_prefix_len and schedule_prefix_len > 0:
+            idx_s = idx_s[:schedule_prefix_len]
+            idx_t = idx_t[:schedule_prefix_len]
+            L = min(idx_s.numel(), idx_t.numel())
+        if L == 0:
+            continue
+        seq_s = shift_logits_s[b, idx_s[:L], :]
+        seq_t = shift_logits_t[b, idx_t[:L], :]
+        if idx_s.numel() != idx_t.numel():
+            kd_mismatch_count += 1
+        p_t = torch.softmax(seq_t / T, dim=-1)
+        log_p_s = torch.log_softmax(seq_s / T, dim=-1)
+        kd_tok = (p_t * (torch.log(p_t + 1e-12) - log_p_s)).sum(dim=-1)
+        if schedule_decay and 0.0 < schedule_decay < 1.0:
+            w = schedule_decay ** torch.arange(L, device=seq_s.device, dtype=torch.float32)
+        else:
+            w = torch.ones(L, device=seq_s.device, dtype=torch.float32)
+        kd_i = (kd_tok * w).sum() / (w.sum() + 1e-8) * (T * T)
+        kd_terms.append(kd_i)
+    mismatch_ratio = kd_mismatch_count / max(1, B)
+    if kd_terms and mismatch_ratio <= kd_mismatch_threshold:
+        kd_loss = torch.stack(kd_terms).mean()
+        kd_valid = len(kd_terms)
+    else:
+        kd_loss = torch.tensor(0.0, device=shift_logits_s.device)
+        kd_valid = 0
+    return kd_loss, kd_valid, kd_mismatch_count, mismatch_ratio
+
+
+def compute_delta_consistency_on_schedule(
+    shift_logits_s_orig: torch.Tensor,
+    shift_logits_s_swap: torch.Tensor,
+    shift_logits_t_orig: torch.Tensor,
+    shift_logits_t_swap: torch.Tensor,
+    shift_labels_s: torch.Tensor,
+    shift_labels_t_orig: torch.Tensor,
+    shift_labels_t_swap: torch.Tensor,
+    schedule_prefix_len: int,
+    schedule_decay: float,
+    valid_rows: Optional[List[bool]] = None,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Delta consistency on schedule segment:
+      (S_orig - S_swap) ~ (T_orig - T_swap)
+    """
+    terms = []
+    B = shift_logits_s_orig.size(0)
+    for b in range(B):
+        if valid_rows is not None and not valid_rows[b]:
+            continue
+        idx_s = (shift_labels_s[b] != -100).nonzero(as_tuple=True)[0]
+        idx_to = (shift_labels_t_orig[b] != -100).nonzero(as_tuple=True)[0]
+        idx_ts = (shift_labels_t_swap[b] != -100).nonzero(as_tuple=True)[0]
+        L = min(idx_s.numel(), idx_to.numel(), idx_ts.numel())
+        if L == 0:
+            continue
+        if schedule_prefix_len and schedule_prefix_len > 0:
+            idx_s = idx_s[:schedule_prefix_len]
+            idx_to = idx_to[:schedule_prefix_len]
+            idx_ts = idx_ts[:schedule_prefix_len]
+            L = min(idx_s.numel(), idx_to.numel(), idx_ts.numel())
+        if L == 0:
+            continue
+        ds = shift_logits_s_orig[b, idx_s[:L], :] - shift_logits_s_swap[b, idx_s[:L], :]
+        dt = shift_logits_t_orig[b, idx_to[:L], :] - shift_logits_t_swap[b, idx_ts[:L], :]
+        tok_loss = (ds - dt).pow(2).mean(dim=-1)
+        if schedule_decay and 0.0 < schedule_decay < 1.0:
+            w = schedule_decay ** torch.arange(L, device=ds.device, dtype=torch.float32)
+        else:
+            w = torch.ones(L, device=ds.device, dtype=torch.float32)
+        terms.append((tok_loss * w).sum() / (w.sum() + 1e-8))
+    if terms:
+        return torch.stack(terms).mean(), len(terms)
+    return torch.tensor(0.0, device=shift_logits_s_orig.device), 0
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train HwKVAligner with bucket schedules.")
     parser.add_argument("--model_path", required=True, help="Bucket base model path")
@@ -207,6 +338,12 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--save_steps", type=int, default=200)
+    parser.add_argument(
+        "--save_keep_last",
+        type=int,
+        default=2,
+        help="How many intermediate checkpoints to keep (-1 keeps all).",
+    )
     parser.add_argument("--l2_reg", type=float, default=1e-5)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -333,6 +470,41 @@ def parse_args():
         action="store_true",
         help="Require swapped hw_id to be different for every sample; otherwise skip swap loss.",
     )
+    parser.add_argument(
+        "--counterfactual_kd_weight",
+        type=float,
+        default=0.0,
+        help="Optional KD weight for counterfactual teacher logits on swapped hw branch.",
+    )
+    parser.add_argument(
+        "--counterfactual_kd_warmup_steps",
+        type=int,
+        default=0,
+        help="Warmup steps before enabling counterfactual KD loss.",
+    )
+    parser.add_argument(
+        "--delta_consistency_weight",
+        type=float,
+        default=0.0,
+        help="Optional weight for delta consistency: (S_orig-S_swap) vs (T_orig-T_cf).",
+    )
+    parser.add_argument(
+        "--delta_consistency_warmup_steps",
+        type=int,
+        default=0,
+        help="Warmup steps before enabling delta consistency loss.",
+    )
+    parser.add_argument(
+        "--hw_probe_weight",
+        type=float,
+        default=0.0,
+        help="Optional HW probe CE weight on injection-side representation (anti-collapse guardrail).",
+    )
+    parser.add_argument(
+        "--hw_probe_detach",
+        action="store_true",
+        help="If set, stop gradients from HW probe back into aligner (diagnostic mode).",
+    )
     parser.add_argument("--lr_scheduler_type", type=str, default="linear", help="Scheduler type for LR warmup/decay")
     parser.add_argument("--warmup_steps", type=int, default=500, help="Warmup steps for LR scheduler")
     parser.add_argument("--kd_mismatch_threshold", type=float, default=0.2, help="If KD length mismatch ratio exceeds, skip KD for batch")
@@ -402,7 +574,7 @@ def main():
     hw_db = load_hw_embeddings(args.hardware_embeddings_path)
 
     preprocess_params = None
-    default_preprocess = "gen/Embedding/preprocess_v4u_zscore_v1.json"
+    default_preprocess = "gen/Embedding/preprocess_v5_zscore_v1_nol2_aligner.json"
     if args.disable_preprocess:
         if args.require_preprocess:
             raise ValueError("disable_preprocess conflicts with require_preprocess.")
@@ -423,7 +595,7 @@ def main():
 
     paths = [p.strip() for p in args.train_json_paths.split(",") if p.strip()]
     dataset = BucketScheduleDataset(paths)
-    if args.swap_kd_weight > 0:
+    if args.swap_kd_weight > 0 or args.counterfactual_kd_weight > 0:
         print(f"[INFO] dataset unique hw_ids={len(dataset.hw_ids_seen)} sample={list(sorted(dataset.hw_ids_seen))[:8]}")
     dataloader = DataLoader(
         dataset,
@@ -434,7 +606,7 @@ def main():
     # build swap hw pool (canonical names) and cache preprocessed vectors
     swap_hw_pool: List[str] = []
     swap_hw_vec_cache: Dict[str, torch.Tensor] = {}
-    if args.swap_kd_weight > 0:
+    if args.swap_kd_weight > 0 or args.counterfactual_kd_weight > 0:
         pool_names = set()
         for hid in sorted(dataset.hw_ids_seen):
             try:
@@ -449,13 +621,52 @@ def main():
                 vec = apply_preprocess(vec.unsqueeze(0), preprocess_params).squeeze(0)
             swap_hw_vec_cache[name] = vec
         print(f"[INFO] swap hw_pool (canon) size={len(swap_hw_pool)}: {swap_hw_pool}")
+        print(
+            f"[CONFIG] swap_kd_weight={args.swap_kd_weight} swap_margin={args.swap_kd_margin} "
+            f"swap_require_diff_hw={bool(args.swap_require_diff_hw)}"
+        )
+    if args.counterfactual_kd_weight > 0:
+        print(
+            f"[CONFIG] counterfactual_kd_weight={args.counterfactual_kd_weight} "
+            f"warmup={args.counterfactual_kd_warmup_steps}"
+        )
+    if args.delta_consistency_weight > 0:
+        print(
+            f"[CONFIG] delta_consistency_weight={args.delta_consistency_weight} "
+            f"warmup={args.delta_consistency_warmup_steps}"
+        )
+        if args.counterfactual_kd_weight <= 0:
+            print("[WARN] delta_consistency_weight>0 but counterfactual_kd_weight<=0; delta loss may stay inactive.")
+    # anti-collapse guardrail: light HW probe on injection-side representation
+    hw_probe_head = None
+    probe_name_to_idx: Dict[str, int] = {}
+    if args.hw_probe_weight > 0:
+        probe_names = set()
+        for hid in sorted(dataset.hw_ids_seen):
+            try:
+                name, _ = resolve_hw_vec(hid, hw_db)
+                probe_names.add(name)
+            except KeyError:
+                continue
+        if len(probe_names) < 2:
+            print("[WARN] hw_probe enabled but <2 resolved hw classes; disabling hw_probe.")
+            args.hw_probe_weight = 0.0
+        else:
+            probe_list = sorted(probe_names)
+            probe_name_to_idx = {n: i for i, n in enumerate(probe_list)}
+            # hw_mlp first layer output dim is 128
+            hw_probe_head = torch.nn.Linear(128, len(probe_list)).to(args.device)
+            print(f"[INFO] hw_probe classes={len(probe_list)} names={probe_list}")
     if args.debug_injection_delta and args.debug_injection_every <= 0:
         args.debug_injection_every = max(1, args.logging_steps)
     if args.debug_hw_swap and args.debug_hw_swap_every <= 0:
         args.debug_hw_swap_every = max(1, args.logging_steps)
     data_iter = iter(dataloader)
 
-    optimizer = AdamW(hw_kv_aligner.parameters(), lr=args.learning_rate)
+    optim_params = list(hw_kv_aligner.parameters())
+    if hw_probe_head is not None:
+        optim_params.extend(hw_probe_head.parameters())
+    optimizer = AdamW(optim_params, lr=args.learning_rate)
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
@@ -488,6 +699,7 @@ def main():
         input_ids_t = batch["input_ids_t"].to(args.device)
         attention_mask_t = batch["attention_mask_t"].to(args.device)
         hw_ids = batch["hw_ids"]
+        texts_full = batch["texts_full"]
 
         # hw embedding batch
         hw_vecs = []
@@ -519,6 +731,7 @@ def main():
             global_step += 1
             continue
         if valid_mask.sum() < labels_s.size(0):
+            keep_idx = valid_mask.nonzero(as_tuple=True)[0].tolist()
             input_ids_s = input_ids_s[valid_mask]
             attention_mask_s = attention_mask_s[valid_mask]
             input_ids_t = input_ids_t[valid_mask]
@@ -526,6 +739,9 @@ def main():
             labels_s = labels_s[valid_mask]
             labels_t = labels_t[valid_mask]
             hw_vec_batch = hw_vec_batch[valid_mask]
+            hw_ids = [hw_ids[i] for i in keep_idx]
+            hw_names = [hw_names[i] for i in keep_idx]
+            texts_full = [texts_full[i] for i in keep_idx]
 
         # Teacher forward (no KV)
         with torch.no_grad():
@@ -674,43 +890,28 @@ def main():
         full_sched = (sched_len_s.float() > 0.9 * shift_labels_s.size(1)).sum().item()
         kd_len_mismatch = (sched_len_s != sched_len_t).sum().item()
 
-        kd_terms = []
         T = args.kd_temperature
-        kd_mismatch_count = 0
-        for b in range(input_ids_s.size(0)):
-            idx_s = (shift_labels_s[b] != -100).nonzero(as_tuple=True)[0]
-            idx_t = (shift_labels_t[b] != -100).nonzero(as_tuple=True)[0]
-            L = min(idx_s.numel(), idx_t.numel())
-            if L == 0:
-                continue
-            if args.schedule_prefix_len and args.schedule_prefix_len > 0:
-                idx_s = idx_s[: args.schedule_prefix_len]
-                idx_t = idx_t[: args.schedule_prefix_len]
-                L = min(idx_s.numel(), idx_t.numel())
-            seq_s = shift_logits_s[b, idx_s[:L], :]
-            seq_t = shift_logits_t[b, idx_t[:L], :]
-            if idx_s.numel() != idx_t.numel():
-                kd_mismatch_count += 1
-            p_t = torch.softmax(seq_t / T, dim=-1)
-            log_p_s = torch.log_softmax(seq_s / T, dim=-1)
-            kd_tok = (p_t * (torch.log(p_t + 1e-12) - log_p_s)).sum(dim=-1)
-            if args.schedule_decay and 0.0 < args.schedule_decay < 1.0:
-                w = args.schedule_decay ** torch.arange(L, device=seq_s.device, dtype=torch.float32)
-            else:
-                w = torch.ones(L, device=seq_s.device, dtype=torch.float32)
-            kd_i = (kd_tok * w).sum() / (w.sum() + 1e-8) * (T * T)
-            kd_terms.append(kd_i)
-        mismatch_ratio = kd_mismatch_count / max(1, input_ids_s.size(0))
-        if kd_terms and mismatch_ratio <= args.kd_mismatch_threshold:
-            kd_loss = torch.stack(kd_terms).mean()
-            kd_valid = len(kd_terms)
-        else:
-            kd_loss = torch.tensor(0.0, device=args.device)
-            kd_valid = 0
+        kd_loss, kd_valid, kd_mismatch_count, mismatch_ratio = compute_kd_on_schedule(
+            shift_logits_s=shift_logits_s,
+            shift_logits_t=shift_logits_t,
+            shift_labels_s=shift_labels_s,
+            shift_labels_t=shift_labels_t,
+            temperature=T,
+            schedule_prefix_len=args.schedule_prefix_len,
+            schedule_decay=args.schedule_decay,
+            kd_mismatch_threshold=args.kd_mismatch_threshold,
+        )
 
         # Swap-KD loss: enforce "wrong hardware" should be worse than correct hardware
+        # + optional counterfactual KD with swapped teacher target.
         swap_loss = torch.tensor(0.0, device=args.device)
         kd_loss_swap = torch.tensor(0.0, device=args.device)
+        kd_valid_swap = 0
+        kd_loss_cf = torch.tensor(0.0, device=args.device)
+        kd_valid_cf = 0
+        delta_loss = torch.tensor(0.0, device=args.device)
+        delta_valid = 0
+        cf_rows = 0
         swap_gap = torch.tensor(0.0, device=args.device)
         swap_applied = False
         swap_skipped_reason = ""
@@ -722,7 +923,12 @@ def main():
                 swap_weight_eff = args.swap_kd_weight + t * (args.swap_kd_weight_end - args.swap_kd_weight)
         if swap_weight_eff <= 0:
             swap_weight_eff = 0.0
-        if args.swap_kd_weight > 0 and global_step >= args.swap_kd_warmup_steps:
+        swap_active = args.swap_kd_weight > 0 or args.counterfactual_kd_weight > 0
+        swap_ready = (
+            (args.swap_kd_weight > 0 and global_step >= args.swap_kd_warmup_steps)
+            or (args.counterfactual_kd_weight > 0 and global_step >= args.counterfactual_kd_warmup_steps)
+        )
+        if swap_active and swap_ready:
             if torch.rand(1).item() <= args.swap_hw_prob:
                 swap_considered += 1
                 B = input_ids_s.size(0)
@@ -750,9 +956,9 @@ def main():
                     # build swap hw_vec batch
                     hw_vec_swap = torch.stack([swap_hw_vec_cache[n] for n in swap_names], dim=0)
                     if args.swap_require_diff_hw:
-                        # verify at least one sample is different; otherwise skip
-                        if all(orig == sw for orig, sw in zip(hw_names, swap_names)):
-                            swap_skipped_reason = "same_hw_only"
+                        # require every sample to be swapped to a different hw
+                        if any(orig == sw for orig, sw in zip(hw_names, swap_names)):
+                            swap_skipped_reason = "same_hw_found"
                     if not swap_skipped_reason:
                         past_swap = hw_kv_aligner(hw_vec_swap, batch_size=input_ids_s.size(0), num_beams=1)
                         past_swap_len = past_swap[0][0].shape[2]
@@ -777,48 +983,89 @@ def main():
                         shift_logits_swap = logits_swap[..., :-1, :].contiguous()
 
                         # KD loss for swapped hw_vec
-                        kd_terms_swap = []
-                        kd_mismatch_count_swap = 0
-                        for b in range(input_ids_s.size(0)):
-                            idx_s = (shift_labels_s[b] != -100).nonzero(as_tuple=True)[0]
-                            idx_t = (shift_labels_t[b] != -100).nonzero(as_tuple=True)[0]
-                            L = min(idx_s.numel(), idx_t.numel())
-                            if L == 0:
-                                continue
-                            if args.schedule_prefix_len and args.schedule_prefix_len > 0:
-                                idx_s = idx_s[: args.schedule_prefix_len]
-                                idx_t = idx_t[: args.schedule_prefix_len]
-                                L = min(idx_s.numel(), idx_t.numel())
-                            seq_s = shift_logits_swap[b, idx_s[:L], :]
-                            seq_t = shift_logits_t[b, idx_t[:L], :]
-                            if idx_s.numel() != idx_t.numel():
-                                kd_mismatch_count_swap += 1
-                            p_t = torch.softmax(seq_t / T, dim=-1)
-                            log_p_s = torch.log_softmax(seq_s / T, dim=-1)
-                            kd_tok = (p_t * (torch.log(p_t + 1e-12) - log_p_s)).sum(dim=-1)
-                            if args.schedule_decay and 0.0 < args.schedule_decay < 1.0:
-                                w = args.schedule_decay ** torch.arange(L, device=seq_s.device, dtype=torch.float32)
-                            else:
-                                w = torch.ones(L, device=seq_s.device, dtype=torch.float32)
-                            kd_i = (kd_tok * w).sum() / (w.sum() + 1e-8) * (T * T)
-                            kd_terms_swap.append(kd_i)
-                        mismatch_ratio_swap = kd_mismatch_count_swap / max(1, input_ids_s.size(0))
-                        if kd_terms_swap and mismatch_ratio_swap <= args.kd_mismatch_threshold:
-                            kd_loss_swap = torch.stack(kd_terms_swap).mean()
+                        kd_loss_swap, kd_valid_swap, _, _ = compute_kd_on_schedule(
+                            shift_logits_s=shift_logits_swap,
+                            shift_logits_t=shift_logits_t,
+                            shift_labels_s=shift_labels_s,
+                            shift_labels_t=shift_labels_t,
+                            temperature=T,
+                            schedule_prefix_len=args.schedule_prefix_len,
+                            schedule_decay=args.schedule_decay,
+                            kd_mismatch_threshold=args.kd_mismatch_threshold,
+                        )
+                        if kd_valid_swap > 0:
                             swap_gap = kd_loss_swap - kd_loss
-                            swap_loss = torch.relu(args.swap_kd_margin + kd_loss - kd_loss_swap)
+                            # Single-sided swap objective:
+                            # stop gradient on "correct-hw" reference to avoid branch cancellation.
+                            swap_loss = torch.relu(args.swap_kd_margin + kd_loss.detach() - kd_loss_swap)
                             swap_applied = True
                             swap_applied_cnt += 1
+
+                            # Counterfactual KD: student(swapped_hw) -> teacher(text_full with swapped arch)
+                            if (
+                                args.counterfactual_kd_weight > 0
+                                and global_step >= args.counterfactual_kd_warmup_steps
+                            ):
+                                text_full_cf = []
+                                cf_valid_mask: List[bool] = []
+                                for text_full_i, swap_name_i in zip(texts_full, swap_names):
+                                    target_arch = infer_arch_from_text_or_hw("", swap_name_i)
+                                    text_cf_i, changed = replace_arch_token(text_full_i, target_arch)
+                                    text_full_cf.append(text_cf_i)
+                                    cf_valid_mask.append(changed)
+                                cf_rows = int(sum(cf_valid_mask))
+                                if cf_rows > 0:
+                                    enc_t_cf = tokenizer(text_full_cf, return_tensors="pt", padding=True).to(args.device)
+                                    with torch.no_grad():
+                                        out_t_cf = model(
+                                            input_ids=enc_t_cf["input_ids"],
+                                            attention_mask=enc_t_cf["attention_mask"],
+                                            use_cache=False,
+                                        )
+                                        logits_t_cf = out_t_cf.logits
+                                    labels_t_cf = build_labels_with_schedule_mask(enc_t_cf["input_ids"], tokenizer).to(args.device)
+                                    labels_t_cf[enc_t_cf["attention_mask"] == 0] = -100
+                                    for i, ok in enumerate(cf_valid_mask):
+                                        if not ok:
+                                            labels_t_cf[i, :] = -100
+                                    shift_logits_t_cf = logits_t_cf[..., :-1, :].contiguous()
+                                    shift_labels_t_cf = labels_t_cf[..., 1:].contiguous()
+                                    kd_loss_cf, kd_valid_cf, _, _ = compute_kd_on_schedule(
+                                        shift_logits_s=shift_logits_swap,
+                                        shift_logits_t=shift_logits_t_cf,
+                                        shift_labels_s=shift_labels_s,
+                                        shift_labels_t=shift_labels_t_cf,
+                                        temperature=T,
+                                        schedule_prefix_len=args.schedule_prefix_len,
+                                        schedule_decay=args.schedule_decay,
+                                        kd_mismatch_threshold=args.kd_mismatch_threshold,
+                                    )
+                                    if (
+                                        args.delta_consistency_weight > 0
+                                        and global_step >= args.delta_consistency_warmup_steps
+                                    ):
+                                        delta_loss, delta_valid = compute_delta_consistency_on_schedule(
+                                            shift_logits_s_orig=shift_logits_s,
+                                            shift_logits_s_swap=shift_logits_swap,
+                                            shift_logits_t_orig=shift_logits_t,
+                                            shift_logits_t_swap=shift_logits_t_cf,
+                                            shift_labels_s=shift_labels_s,
+                                            shift_labels_t_orig=shift_labels_t,
+                                            shift_labels_t_swap=shift_labels_t_cf,
+                                            schedule_prefix_len=args.schedule_prefix_len,
+                                            schedule_decay=args.schedule_decay,
+                                            valid_rows=cf_valid_mask,
+                                        )
                         else:
                             swap_skipped_reason = "kd_mismatch"
             else:
                 swap_skipped_reason = "prob_skip"
-        if args.swap_kd_weight > 0 and not swap_applied and args.swap_require_diff_hw and not warned_single_hw:
+        if swap_active and not swap_applied and args.swap_require_diff_hw and not warned_single_hw:
             # if we keep skipping because batch has only one hw, warn once
             if len(set(hw_ids)) < 2:
-                print("[WARN] swap_kd enabled but batch has only one hw_id; swap loss skipped.")
+                print("[WARN] swap/counterfactual enabled but batch has only one hw_id; swap branch skipped.")
                 warned_single_hw = True
-        if args.swap_kd_weight > 0 and not swap_applied and swap_skipped_reason:
+        if swap_active and not swap_applied and swap_skipped_reason:
             swap_skipped_cnt += 1
 
         gain_loss = torch.tensor(0.0, device=args.device)
@@ -841,6 +1088,25 @@ def main():
             lm_loss_noinj = (per_tok_noinj * sched_weights).sum() / (sched_weights.sum() + 1e-8)
             gain_loss = torch.relu(lm_loss_noinj - lm_loss - args.gain_margin)
 
+        probe_loss = torch.tensor(0.0, device=args.device)
+        probe_acc = 0.0
+        probe_valid = 0
+        if hw_probe_head is not None and args.hw_probe_weight > 0:
+            target_idx = [probe_name_to_idx.get(n, -1) for n in hw_names]
+            target_t = torch.tensor(target_idx, dtype=torch.long, device=args.device)
+            valid_probe = target_t >= 0
+            probe_valid = int(valid_probe.sum().item())
+            if probe_valid > 0:
+                # Use injection-side representation as anti-collapse signal.
+                probe_feat = F.relu(hw_kv_aligner.hw_mlp[0](hw_vec_batch))
+                if args.hw_probe_detach:
+                    probe_feat = probe_feat.detach()
+                probe_logits = hw_probe_head(probe_feat)
+                probe_loss = F.cross_entropy(probe_logits[valid_probe], target_t[valid_probe])
+                with torch.no_grad():
+                    pred = probe_logits[valid_probe].argmax(dim=-1)
+                    probe_acc = (pred == target_t[valid_probe]).float().mean().item()
+
         l2_reg = sum(p.pow(2).sum() for p in hw_kv_aligner.parameters())
         scale_reg = args.kv_scale_reg * (hw_kv_aligner.kv_scale - args.kv_scale_init).pow(2)
         loss = (
@@ -848,6 +1114,9 @@ def main():
             + args.kd_weight * kd_loss
             + args.gain_weight * gain_loss
             + swap_weight_eff * swap_loss
+            + args.counterfactual_kd_weight * kd_loss_cf
+            + args.delta_consistency_weight * delta_loss
+            + args.hw_probe_weight * probe_loss
             + args.l2_reg * l2_reg
             + scale_reg
         )
@@ -870,8 +1139,10 @@ def main():
                 f"linker_weights { _grad_stats(getattr(hw_kv_aligner, 'linker_weights', None)) }",
                 f"kv_scale { _grad_stats(getattr(hw_kv_aligner, 'kv_scale', None)) }",
             ]
+            if hw_probe_head is not None:
+                grad_msgs.append(f"hw_probe.w { _grad_stats(getattr(hw_probe_head, 'weight', None)) }")
             print(f"[GRAD] step {global_step + 1} " + " | ".join(grad_msgs))
-        torch.nn.utils.clip_grad_norm_(hw_kv_aligner.parameters(), args.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(optim_params, args.max_grad_norm)
         optimizer.step()
         lr_scheduler.step()
         with torch.no_grad():
@@ -890,17 +1161,33 @@ def main():
                     f"zero={zero_sched} full90={full_sched} kd_mismatch={kd_len_mismatch}"
                 )
             extra = ""
-            if args.swap_kd_weight > 0:
+            if swap_active:
                 swap_ratio = 0.0
                 if swap_considered > 0:
                     swap_ratio = swap_applied_cnt / swap_considered
                 swap_info = (
                     f"kd_swap={kd_loss_swap.item():.4f} swap_gap={swap_gap.item():.4f} "
-                    f"swap_loss={swap_loss.item():.4f} swap_ratio={swap_ratio:.2f} swap_w={swap_weight_eff:.3f}"
+                    f"swap_loss={swap_loss.item():.4f} swap_ratio={swap_ratio:.2f} swap_w={swap_weight_eff:.3f} "
+                    f"swap_valid={kd_valid_swap}"
                 )
                 if not swap_applied:
                     swap_info += f" swap_skip={swap_skipped_reason}"
                 extra = " " + swap_info
+            if args.counterfactual_kd_weight > 0:
+                extra += (
+                    f" cf_kd={kd_loss_cf.item():.4f} cf_valid={kd_valid_cf} "
+                    f"cf_rows={cf_rows} cf_w={args.counterfactual_kd_weight:.3f}"
+                )
+            if args.delta_consistency_weight > 0:
+                extra += (
+                    f" delta={delta_loss.item():.4f} delta_valid={delta_valid} "
+                    f"delta_w={args.delta_consistency_weight:.3f}"
+                )
+            if args.hw_probe_weight > 0:
+                extra += (
+                    f" probe={probe_loss.item():.4f} probe_acc={probe_acc:.3f} "
+                    f"probe_valid={probe_valid} probe_w={args.hw_probe_weight:.3f}"
+                )
             print(
                 f"step {global_step}: lm_loss={lm_loss.item():.4f} kd_loss={kd_loss.item():.4f} kd_valid={kd_valid} "
                 f"gain={gain_loss.item():.4f} l2={l2_reg.item():.4f} loss={loss.item():.4f} "
@@ -936,8 +1223,8 @@ def main():
             torch.save(payload, ckpt_path)
             print(f"Saved HwKVAligner checkpoint to {ckpt_path}")
             saved_ckpts.append(ckpt_path)
-            # 保留最近 2 个中间 checkpoint
-            if len(saved_ckpts) > 2:
+            # Keep only recent intermediate checkpoints unless disabled.
+            if args.save_keep_last >= 0 and len(saved_ckpts) > args.save_keep_last:
                 old = saved_ckpts.pop(0)
                 try:
                     os.remove(old)

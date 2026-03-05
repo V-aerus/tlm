@@ -56,15 +56,16 @@ def get_testtuning_files():
 
 def get_measure_records(mode: str = "all"):
     from common import HARDWARE_PLATFORM
-    print(f"Checking utils_json_path: {utils_json_path}")
+    debug = os.environ.get("TLM_DEBUG_UTILS", "0") == "1"
     if not os.path.exists(utils_json_path):
-        print("utils.json does not exist")
+        if debug:
+            print(f"[utils] utils.json does not exist: {utils_json_path}")
         return []
     try:
         with open(utils_json_path, 'r') as f:
             data = json.load(f)
-        print(f"Loaded utils.json: {data}")
-        print(f"HARDWARE_PLATFORM: {HARDWARE_PLATFORM}")
+        if debug:
+            print(f"[utils] HARDWARE_PLATFORM: {HARDWARE_PLATFORM}")
         if HARDWARE_PLATFORM in data:
             key = "measure_records"
             if mode == "base":
@@ -72,12 +73,15 @@ def get_measure_records(mode: str = "all"):
             elif mode == "kv_lora":
                 key = "measure_records_kv_lora"
             if key in data[HARDWARE_PLATFORM]:
-                print(f"Found {key}: {data[HARDWARE_PLATFORM][key]}")
+                if debug:
+                    print(f"[utils] Found {key}: {len(data[HARDWARE_PLATFORM][key])} paths")
                 return data[HARDWARE_PLATFORM][key]
     except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"Error reading utils.json: {e}")
+        if debug:
+            print(f"[utils] Error reading utils.json: {e}")
         return []
-    print("No measure_records found for HARDWARE_PLATFORM")
+    if debug:
+        print("[utils] No measure_records found for HARDWARE_PLATFORM")
     return []
 
 def add_measure_records(file):

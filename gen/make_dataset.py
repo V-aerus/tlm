@@ -271,9 +271,14 @@ def canonical_to_bucket(target_str: str) -> str:
     #   TVM should always consume canonical targets; bucket tokens are only for
     #   the TLM text channel (input_to_tokens) and KV side-channel alignment.
     tokens = target_str.split()
+    arm_host_hint = any(
+        ("aarch64" in tok) or ("carmel" in tok) or ("cortex-a" in tok)
+        for tok in tokens
+    )
     for i, tok in enumerate(tokens):
         if tok.startswith("-arch=sm_"):
-            if tok.startswith("-arch=sm_72"):
+            sm = tok[len("-arch=sm_") :]
+            if sm in ("72", "87") or arm_host_hint:
                 tokens[i] = "[HW_GPU_EDGE]"
             else:
                 tokens[i] = "[HW_GPU_HPC]"

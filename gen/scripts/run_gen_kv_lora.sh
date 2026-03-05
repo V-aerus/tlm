@@ -42,9 +42,24 @@ fi
 source "$PATHS_SH"
 
 ITER=$(printf "iter%02d" "$IDX")
-CUDA_ID="${EDGE_CUDA:-0}"
-EDGE_EMB_PATH="${EDGE_LORA_EMB:-${HW_EMB_V4U:-$HW_EMB_V4}}"
+CUDA_ID="${EDGE_CUDA:-2}"
+if [[ -n "${EDGE_LORA_EMB:-}" ]]; then
+  EDGE_EMB_PATH="$EDGE_LORA_EMB"
+elif [[ -n "${EDGE_EMB_PATH:-}" ]]; then
+  EDGE_EMB_PATH="$EDGE_EMB_PATH"
+elif [[ -n "${HW_EMB_V5:-}" && -f "${HW_EMB_V5}" ]]; then
+  EDGE_EMB_PATH="$HW_EMB_V5"
+elif [[ -f "$TLM_ROOT/gen/Embedding/hardware_embeddings_v5_draft.json" ]]; then
+  EDGE_EMB_PATH="$TLM_ROOT/gen/Embedding/hardware_embeddings_v5_draft.json"
+else
+  EDGE_EMB_PATH="${HW_EMB_V4U:-$HW_EMB_V4}"
+fi
 KEEP_CNT="${EDGE_KEEP_CNT:-16}"
+EDGE_HW_KV_ALIGNER="${EDGE_HW_KV_ALIGNER:-$HW_KV_ALIGNER}"
+if [[ ! -f "$EDGE_HW_KV_ALIGNER" ]]; then
+  echo "hw kv aligner not found: $EDGE_HW_KV_ALIGNER"
+  exit 1
+fi
 
 run_gen() {
   local hw_id="$1"
@@ -79,7 +94,7 @@ run_gen() {
     --keep_cnt "$KEEP_CNT" \
     --use_bucket \
     --use_hw_kv --hw_kv_mode real \
-    --hw_kv_aligner_path "$HW_KV_ALIGNER" \
+    --hw_kv_aligner_path "$EDGE_HW_KV_ALIGNER" \
     --hardware_embedding_path "$EDGE_EMB_PATH" \
     --pos_compensate \
     | tee "$log_file"

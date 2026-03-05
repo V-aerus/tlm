@@ -76,8 +76,8 @@ class ScriptArguments:
         metadata={"help": "Comma-separated EdgeTLM LoRA expert directories (enables expert routing)"},
     )
     edge_embedding_path: str = field(
-        default="Embedding/hardware_embeddings_v4_universe.json",
-        metadata={"help": "Path to hardware_embeddings_v4_universe.json for expert routing (must match router.json dim)"},
+        default="gen/Embedding/hardware_embeddings_v5_draft.json",
+        metadata={"help": "Path to hardware embeddings for expert routing (must match router.json dim)"},
     )
     edge_topk: int = field(default=1, metadata={"help": "Top-K experts to activate during inference"})
     edge_dump_meta: bool = field(
@@ -93,8 +93,8 @@ class ScriptArguments:
         metadata={"help": "Allow mixing experts with different router preprocess meta."},
     )
     hardware_embedding_path: str = field(
-        default="Embedding/hardware_embeddings_v4_universe.json",
-        metadata={"help": "Path to hardware_embeddings_v4_universe.json"},
+        default="gen/Embedding/hardware_embeddings_v5_draft.json",
+        metadata={"help": "Path to hardware embeddings for HwKVAligner input"},
     )
     target_hardware: Optional[str] = field(
         default=None,
@@ -169,6 +169,11 @@ DEFAULT_HW_NAME_MAP = {
     "3090": "nvidia/geforce-rtx-3090",
     "jetson-agx-xavier": "nvidia/jetson-agx-xavier",
     "xavier": "nvidia/jetson-agx-xavier",
+    "jetson-orin": "nvidia/jetson-orin",
+    "orin": "nvidia/jetson-orin",
+    "nvidia/jetson-orin": "nvidia/jetson-orin",
+    "jetson-orin-32gb": "nvidia/jetson-orin-32gb",
+    "orin-32gb": "nvidia/jetson-orin-32gb",
     "xeon": "aws/cpu/c5.18xlarge",
     "c5.18xlarge": "aws/cpu/c5.18xlarge",
     "2080": "nvidia/geforce-rtx-2080-ti",
@@ -192,6 +197,8 @@ def extract_hardware_id_from_target(target) -> str:
         return "2080"
     if "xavier" in target_str or "sm_72" in target_str:
         return "xavier"
+    if "orin" in target_str or "sm_87" in target_str:
+        return "orin"
     if "xeon" in target_str or "skylake" in target_str:
         return "xeon"
     return "v100"
@@ -405,10 +412,15 @@ def prepare_hw_kv_context(
             log_debug(f"[WARN] Failed to load HwKVAligner checkpoint: {e}")
 
     if preprocess_params is None:
-        default_pre = Path("gen/Embedding/preprocess_v4u_zscore_v1.json")
-        preprocess_params = load_preprocess_params(str(default_pre))
-        if preprocess_params:
-            preprocess_source = "default"
+        default_candidates = [
+            Path("gen/Embedding/preprocess_v5_zscore_v1_nol2_aligner.json"),
+            Path("gen/Embedding/preprocess_v4u_zscore_v1.json"),
+        ]
+        for default_pre in default_candidates:
+            preprocess_params = load_preprocess_params(str(default_pre))
+            if preprocess_params:
+                preprocess_source = f"default:{default_pre.name}"
+                break
 
     if preprocess_params:
         msg = f"[HW-KV] preprocess={summarize_preprocess(preprocess_params)} source={preprocess_source}"

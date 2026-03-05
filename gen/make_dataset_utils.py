@@ -50,6 +50,8 @@ def detect_hardware_from_target(target_str: str) -> Tuple[str, str]:
         return "v100", "nvidia/nvidia-v100"
     if "sm_86" in lower or "4090" in lower or "a40" in lower:
         return "4090", "nvidia/nvidia-a40"
+    if "orin" in lower or "sm_87" in lower:
+        return "orin", "nvidia/jetson-orin"
     if "xavier" in lower or "sm_72" in lower or "jetson" in lower:
         return "xavier", "nvidia/jetson-agx-xavier"
     if "llvm" in lower or "xeon" in lower or "skylake" in lower:

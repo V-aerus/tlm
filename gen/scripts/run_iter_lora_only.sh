@@ -48,7 +48,15 @@ fi
 # shellcheck disable=SC1090
 source "$PATHS_SH"
 
-EDGE_EMB_JSON="${EDGE_EMB_JSON:-${HW_EMB_V4U:-$HW_EMB_V4}}"
+if [[ -z "${EDGE_EMB_JSON:-}" ]]; then
+  if [[ -n "${HW_EMB_V5:-}" && -f "${HW_EMB_V5}" ]]; then
+    EDGE_EMB_JSON="$HW_EMB_V5"
+  elif [[ -f "$TLM_ROOT/gen/Embedding/hardware_embeddings_v5_draft.json" ]]; then
+    EDGE_EMB_JSON="$TLM_ROOT/gen/Embedding/hardware_embeddings_v5_draft.json"
+  else
+    EDGE_EMB_JSON="${HW_EMB_V4U:-$HW_EMB_V4}"
+  fi
+fi
 
 ITER=$(printf "iter%02d" "$IDX")
 GAIN_TAG="${EDGE_GAIN_TAG:-v${STAGE}_gain}"
@@ -226,7 +234,7 @@ if [[ "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_BASE" ]]; then
     --output-jsonl "$EDGE_SFT_BASE" \
     --merge_mode base_left \
     --merge_key repr \
-    --dedupe_mode keep_all \
+    --dedupe_mode "${EDGE_DEDUPE_MODE:-min}" \
     --hardware-id "$HW" \
     --embedding-json "$EDGE_EMB_JSON" \
     --allow-missing-lora
@@ -241,7 +249,7 @@ if [[ "$LORA_JSON_COUNT" -gt 0 && ( "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_L
     --output-jsonl "$EDGE_SFT_LORA" \
     --merge_mode lora_left \
     --merge_key repr \
-    --dedupe_mode keep_all \
+    --dedupe_mode "${EDGE_DEDUPE_MODE:-min}" \
     --hardware-id "$HW" \
     --embedding-json "$EDGE_EMB_JSON"
 fi
@@ -254,7 +262,7 @@ if [[ "$LORA_JSON_COUNT" -gt 0 && ( "$FORCE_PREPARE" == "1" || ! -s "$EDGE_SFT_M
     --output-jsonl "$EDGE_SFT_MERGED" \
     --merge_key repr \
     --merge_mode lora_left \
-    --dedupe_mode keep_all \
+    --dedupe_mode "${EDGE_DEDUPE_MODE:-min}" \
     --embedding-json "$EDGE_EMB_JSON"
 fi
 if [[ "$LORA_JSON_COUNT" -eq 0 ]]; then

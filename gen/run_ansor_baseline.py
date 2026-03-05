@@ -29,6 +29,16 @@ def resolve_target_string(target_str: str) -> str:
             "-registers_per_block=65536 "
             "-thread_warp_size=32"
         )
+    if ts in ("orin", "jetson-orin", "nvidia/jetson-orin"):
+        return (
+            "cuda -keys=cuda,gpu "
+            "-arch=sm_87 "
+            "-max_num_threads=1024 "
+            "-max_shared_memory_per_block=49152 "
+            "-max_threads_per_block=1024 "
+            "-registers_per_block=65536 "
+            "-thread_warp_size=32"
+        )
     return target_str
 
 
@@ -134,6 +144,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", type=str, required=True)
     parser.add_argument(
+        "--host_target",
+        type=str,
+        default="",
+        help="Optional host target string; when set, use Target(device, host=host_target).",
+    )
+    parser.add_argument(
         "--network_names",
         type=str,
         default=None,
@@ -176,12 +192,37 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--min_repeat_ms", type=int, default=100)
     parser.add_argument("--timeout", type=int, default=10)
+    parser.add_argument(
+        "--builder_timeout",
+        type=int,
+        default=120,
+        help="LocalBuilder compile timeout in seconds.",
+    )
+    parser.add_argument(
+        "--builder_n_parallel",
+        type=int,
+        default=1,
+        help="LocalBuilder parallel compile workers (use 1 for easier debugging).",
+    )
+    parser.add_argument(
+        "--builder_verbose",
+        type=int,
+        default=2,
+        help="LocalBuilder verbose level (2 prints detailed compile stderr).",
+    )
     parser.add_argument("--verbose", type=int, default=1)
     parser.add_argument("--force", action="store_true", help="Retune even if log exists.")
     args = parser.parse_args()
 
-    register_data_path(args.target)
-    target = tvm.target.Target(resolve_target_string(args.target))
+    resolved_target = resolve_target_string(args.target)
+    register_data_path(resolved_target)
+    if args.host_target:
+        target = tvm.target.Target(resolved_target, host=args.host_target)
+    else:
+        target = tvm.target.Target(resolved_target)
+    print(f"[TARGET] device={target}")
+    if getattr(target, "host", None) is not None:
+        print(f"[TARGET] host={target.host}")
     if common.NETWORK_INFO_FOLDER is None:
         raise RuntimeError("NETWORK_INFO_FOLDER is not set; call register_data_path first.")
 
@@ -270,6 +311,22 @@ def main() -> None:
         timeout=args.timeout,
         min_repeat_ms=args.min_repeat_ms,
     )
+    try:
+        builder = auto_scheduler.LocalBuilder(
+            timeout=args.builder_timeout,
+            n_parallel=args.builder_n_parallel,
+            verbose=args.builder_verbose,
+        )
+    except TypeError:
+        # Backward compatibility for older TVM builds without verbose arg.
+        builder = auto_scheduler.LocalBuilder(
+            timeout=args.builder_timeout,
+            n_parallel=args.builder_n_parallel,
+        )
+    print(
+        f"[BUILDER] timeout={args.builder_timeout}s "
+        f"n_parallel={args.builder_n_parallel} verbose={args.builder_verbose}"
+    )
 
     summary_fields = [
         "row_type",
@@ -334,6 +391,7 @@ def main() -> None:
                     )
                     options = auto_scheduler.TuningOptions(
                         num_measure_trials=budget,
+                        builder=builder,
                         runner=runner,
                         verbose=args.verbose,
                         measure_callbacks=[auto_scheduler.RecordToFile(log_path)],
