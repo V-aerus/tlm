@@ -636,8 +636,15 @@ def main():
             pos = base.find('([')
             return base[pos:] if pos > 0 else base
         hold_out_set_normalized = {_normalize_name(f) for f in hold_out_files}
-        # 兼容旧逻辑：ONLY_BERT/ANSOR 仅保留对应 hold-out；其他模式移除 hold-out
-        if script_args.for_type in (FOR_GEN_EVAL_SKETCH_ONLY_BERT, FOR_GEN_EVAL_SKETCH_ANSOR):
+        # 保留逻辑：
+        # - for_gen_eval_sketch_only_bert / for_gen_eval_sketch_ansor：仅保留对应 hold-out 子集
+        # - for_gen_evaltuning_sketch：按 README testtuning 定义，保留 hold-out（目标 workload）
+        # - for_gen_eval_sketch：评测前生成用，移除 hold-out（避免和 test 集重叠）
+        if script_args.for_type in (
+            FOR_GEN_EVAL_SKETCH_ONLY_BERT,
+            FOR_GEN_EVAL_SKETCH_ANSOR,
+            FOR_GEN_EVALTUNING_SKETCH,
+        ):
             files_new = []
             for file in files:
                 # 优先匹配去前缀名称；若不匹配，尝试去掉硬件前缀直接与原始 hold-out 名称比对

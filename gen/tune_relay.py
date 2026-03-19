@@ -118,6 +118,18 @@ def _parse_args():
         help="example: graph / vm",
         required=True,
     )
+    args.add_argument(
+        "--use-auto-scheduler",
+        type=lambda x: bool(strtobool(x)),
+        help="Enable relay auto_scheduler path with ApplyHistoryBest (True/False).",
+        default=True,
+    )
+    args.add_argument(
+        "--fallback-topi-on-fail",
+        type=lambda x: bool(strtobool(x)),
+        help="When auto-scheduler build/runtime fails, fallback to non-auto-scheduler compile in-process.",
+        default=True,
+    )
     parsed = args.parse_args()
     parsed.target = tvm.target.Target(resolve_target_string(parsed.target))
     parsed.input_shape = json.loads(parsed.input_shape)
@@ -245,27 +257,74 @@ def main():
         #         )
 
         relay_build = {"graph": relay.build, "vm": relay.vm.compile}[ARGS.backend]
-        with ms.Profiler.timeit("PostTuningCompilation"):
+
+        def _compile_with_auto_scheduler():
             with auto_scheduler.ApplyHistoryBest(log_file):
                 with tvm.transform.PassContext(
                     opt_level=3,
                     config={"relay.backend.use_auto_scheduler": True},
                 ):
-                    lib = relay_build(
+                    return relay_build(
                         mod,
                         target=ARGS.target,
                         params=params,
                     )
+
+        def _compile_without_auto_scheduler():
+            with tvm.transform.PassContext(opt_level=3):
+                return relay_build(
+                    mod,
+                    target=ARGS.target,
+                    params=params,
+                )
+
+        build_mode = "topi"
+        fallback_reason = ""
+        with ms.Profiler.timeit("PostTuningCompilation"):
+            if ARGS.use_auto_scheduler:
+                try:
+                    lib = _compile_with_auto_scheduler()
+                    build_mode = "auto_scheduler"
+                except Exception as auto_exc:
+                    if not ARGS.fallback_topi_on_fail:
+                        raise
+                    fallback_reason = f"{type(auto_exc).__name__}: {auto_exc}"
+                    print("[WARN] auto-scheduler compile failed, fallback to TOPI compile.")
+                    print(f"[WARN] fallback reason: {fallback_reason[:800]}")
+                    lib = _compile_without_auto_scheduler()
+                    build_mode = "fallback_topi_compile"
+            else:
+                lib = _compile_without_auto_scheduler()
+                build_mode = "topi"
     print("Tuning Time:")
     print(profiler.table())
+    print(f"[BUILD_MODE] {build_mode}")
+    if fallback_reason:
+        print(f"[BUILD_FALLBACK_REASON] {fallback_reason[:800]}")
 
     from tvm.contrib import graph_executor
-    dev = tvm.device(str(ARGS.target), 0)
-    module = graph_executor.GraphModule(lib["default"](dev))
-    data_tvm = tvm.nd.array((np.random.uniform(size=input_shape)).astype(input_dtype))
-    module.set_input(input_name, data_tvm)
+
+    def _benchmark(current_lib):
+        dev = tvm.device(str(ARGS.target), 0)
+        module = graph_executor.GraphModule(current_lib["default"](dev))
+        data_tvm = tvm.nd.array((np.random.uniform(size=input_shape)).astype(input_dtype))
+        module.set_input(input_name, data_tvm)
+        return module.benchmark(dev, repeat=10, min_repeat_ms=500)
+
     print("Evaluate inference time cost...")
-    print(module.benchmark(dev, repeat=10, min_repeat_ms=500))
+    try:
+        bench_res = _benchmark(lib)
+    except Exception as runtime_exc:
+        if ARGS.use_auto_scheduler and ARGS.fallback_topi_on_fail and build_mode == "auto_scheduler":
+            print("[WARN] auto-scheduler runtime failed, fallback to TOPI compile and rerun benchmark.")
+            print(f"[WARN] runtime reason: {type(runtime_exc).__name__}: {runtime_exc}")
+            lib = _compile_without_auto_scheduler()
+            build_mode = "fallback_topi_runtime"
+            print(f"[BUILD_MODE] {build_mode}")
+            bench_res = _benchmark(lib)
+        else:
+            raise
+    print(bench_res)
 
 
 if __name__ == "__main__":

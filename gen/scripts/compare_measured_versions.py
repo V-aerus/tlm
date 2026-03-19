@@ -5,10 +5,18 @@ import glob
 import os
 import pickle
 import re
+import sys
 from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 
 import tvm
 from tvm import auto_scheduler
+
+# Allow running script via absolute path without requiring cwd=gen.
+_THIS_DIR = Path(__file__).resolve().parent
+_GEN_DIR = _THIS_DIR.parent
+if str(_GEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_GEN_DIR))
 
 import common
 '''

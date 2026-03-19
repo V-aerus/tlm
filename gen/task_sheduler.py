@@ -61,24 +61,38 @@ def main():
 
     model_dic = {}
     times_model_dic = {}
+    missing_task_total = 0
     for filename in tqdm.tqdm(filenames):
         model_dic[filename] = {}
         times_model_dic[filename] = 0
         tasks, task_weights = pickle.load(open(filename, "rb"))
+        missing_this_file = 0
         for task, weight in zip(tasks, task_weights):
             workload_key = task.workload_key
             if workload_key in best_history:
                 model_dic[filename][workload_key] = (best_history[workload_key], weight)
                 times_model_dic[filename] += times_dic[workload_key]
             else:
-                assert(False)
+                if script_args.for_testtuning:
+                    # testtuning 阶段可能只覆盖了部分 hold-out 子图，允许缺失并跳过
+                    missing_this_file += 1
+                    continue
+                raise AssertionError(f"Missing workload key in history: {workload_key}")
+        if missing_this_file > 0:
+            missing_task_total += missing_this_file
+            print(f"[WARN] {os.path.basename(filename)} missing workloads: {missing_this_file}")
 
     from common import clean_name
 
     key_str_set_total = set()
     print('times_model_dic:', list(times_model_dic.values())[:10])
+    if missing_task_total > 0:
+        print(f"[WARN] total missing workloads skipped: {missing_task_total}")
     for model, tasks_his_wei in model_dic.items():
         if len(tasks_his_wei) == 0:
+            if script_args.for_testtuning:
+                print(f"[WARN] skip model with zero covered workloads: {os.path.basename(model)}")
+                continue
             assert(False)
             continue
         key_str_set = set()
@@ -115,6 +129,12 @@ def main():
             if len(key_str_set) == want_cnt:
                     break
         key_str_set_total.update(key_str_set)
+
+    if len(key_str_set_total) == 0:
+        raise RuntimeError(
+            "task_sheduler produced empty set. "
+            "Likely no usable workloads in provided finetuning/testtuning records."
+        )
 
     from common import HARDWARE_PLATFORM
     with open(os.path.join(model_path, f'task_sheduler_{HARDWARE_PLATFORM}.pkl'), 'wb') as f:

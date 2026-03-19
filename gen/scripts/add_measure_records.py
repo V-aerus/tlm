@@ -51,6 +51,7 @@ def main() -> None:
     parser.add_argument("--utils-path", default=None, help="Explicit utils.json path.")
     parser.add_argument("--paths-sh", default=None, help="Optional paths.sh (used to read RUN_ROOT).")
     parser.add_argument("--measured-path", default=None, help="Explicit measured file path (overrides run-root/tag).")
+    parser.add_argument("--also-testtuning", action="store_true", help="Also append to utils[hardware].testtuning_files.")
     parser.add_argument("--dry-run", action="store_true", help="Only print planned changes; do not write.")
     args = parser.parse_args()
 
@@ -110,20 +111,23 @@ def main() -> None:
             list_name = "measure_records_kv_lora"
 
         before_count = len(target_list)
-        if measured_path in target_list:
-            print("Already present in utils.json:")
-            print(f"  utils_path: {utils_path}")
-            print(f"  hardware: {hw_key}")
-            print(f"  measured_path: {measured_path}")
-            print(f"  list: {list_name}")
-            print(f"  count: {before_count}")
-            return
-
+        before_measure_records = len(utils[hw_key]["measure_records"])
         if measured_path not in utils[hw_key]["measure_records"]:
             utils[hw_key]["measure_records"].append(measured_path)
         if measured_path not in target_list:
             target_list.append(measured_path)
         after_count = len(target_list)
+        after_measure_records = len(utils[hw_key]["measure_records"])
+
+        testtuning_before = None
+        testtuning_after = None
+        if args.also_testtuning:
+            utils.setdefault(hw_key, {}).setdefault("testtuning_files", [])
+            testtuning_list = utils[hw_key]["testtuning_files"]
+            testtuning_before = len(testtuning_list)
+            if measured_path not in testtuning_list:
+                testtuning_list.append(measured_path)
+            testtuning_after = len(testtuning_list)
 
         print("Planned update:")
         print(f"  utils_path: {utils_path}")
@@ -131,6 +135,16 @@ def main() -> None:
         print(f"  measured_path: {measured_path}")
         print(f"  list: {list_name}")
         print(f"  count: {before_count} -> {after_count}")
+        print(f"  measure_records: {before_measure_records} -> {after_measure_records}")
+        if args.also_testtuning:
+            print(f"  testtuning_files: {testtuning_before} -> {testtuning_after}")
+
+        changed = (before_count != after_count) or (before_measure_records != after_measure_records)
+        if args.also_testtuning:
+            changed = changed or (testtuning_before != testtuning_after)
+        if not changed:
+            print("No changes required.")
+            return
 
         if args.dry_run:
             print("Dry run: no changes written.")
